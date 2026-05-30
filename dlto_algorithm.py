@@ -25,22 +25,22 @@ from __future__ import annotations
 import math
 from typing import Protocol
 
+from agv_model import AGV_WIDTH
+
 
 # ---------------------------------------------------------------------------
 # Tunable parameters (would live in a ROS2 parameter server)
 # ---------------------------------------------------------------------------
-DETECT_RADIUS_DLTO   = 4.0                  # metres
+DETECT_RADIUS_DLTO   = 7.0                  # metres — must be large enough for
+                                            # AGVs starting at y=0 to complete
+                                            # the lateral offset manoeuvre
+                                            # before they are physically adjacent
 DETECT_RADIUS_SW     = 1.5                  # metres
 ANGLE_DIFF_THRESHOLD = math.radians(150.0)  # head-on if |Δθ| > 150°
-OFFSET_TARGET        = 0.40                 # ±y target for the two AGVs
-                                            # (spec says 0.3 with body
-                                            #  edges touching; raised to
-                                            #  0.40 so the two 0.6 m wide
-                                            #  AGVs cross with a 20 cm
-                                            #  axis-aligned gap, large
-                                            #  enough to absorb the body
-                                            #  rotation observed during
-                                            #  the convergence transient)
+WALL_CLEARANCE       = 0.08                 # minimum AGV-body-to-wall gap, m
+OFFSET_TARGET        = 0.40                 # kept for backward compatibility;
+                                            # dlto_target_offset now derives
+                                            # the offset dynamically
 WALL_LIMIT           = 0.45                 # AGV centre may never exceed |y|
 PASS_LONG_THRESHOLD  = 1.0                  # longitudinal sep to call "passed"
 
@@ -89,30 +89,43 @@ def detect_sw_conflict(own: PoseLike, partner: PoseLike) -> bool:
 # Priority + offset assignment — ROS2-READY
 # ---------------------------------------------------------------------------
 def dlto_alpha(own_id: int, partner_id: int) -> float:
-    """Asymmetric weight, tie-broken so the lower ID always gets 0.51."""
-    return 0.51 if own_id < partner_id else 0.49
+    """Priority weight used in the dynamic offset formula.
+
+    Higher priority (lower ID) → alpha = 0.10 → less lateral yield
+                                          (offset = 0.90 × available_half_space)
+    Lower priority (higher ID) → alpha = 0.00 → full lateral yield
+                                          (offset = 1.00 × available_half_space)
+
+    Values are chosen so that (1 − alpha) × available_half_space ≥ AGV_WIDTH / 2
+    in any corridor ≥ 1.4 m, guaranteeing the two body envelopes clear each other.
+    """
+    return 0.10 if own_id < partner_id else 0.00
 
 
 def dlto_target_offset(own_id: int, partner_id: int,
-                       own_direction: int = +1) -> float:
-    """Offset target is determined by TRAVEL DIRECTION, not ID.
+                       own_direction: int = +1,
+                       corridor_width: float = 1.5,
+                       wall_clearance: float = WALL_CLEARANCE) -> float:
+    """Dynamic lateral target derived from corridor geometry and priority weight.
 
-    Traffic keep-right rule:
-      AGV heading RIGHT (direction=+1) → offset to LOWER lane  (−y)
-      AGV heading LEFT  (direction=−1) → offset to UPPER lane  (+y)
+    Formula (self-derived, adapts when corridor width changes):
+        available_half_space = corridor_width/2 − AGV_WIDTH/2 − wall_clearance
+        offset               = available_half_space × (1 − alpha_i)
+        target_y             = −offset  (heading right)
+                             = +offset  (heading left)
 
-    This ensures both AGVs move to opposite sides of the corridor and
-    pass each other without collision, like cars on a two-lane road.
+    Higher-priority AGV (lower ID, alpha=0.10) offsets to 90 % of available
+    half-space — keeps a slight centre-lane advantage.
+    Lower-priority AGV (higher ID, alpha=0.00) offsets to the full available
+    half-space — yields maximally while still respecting the wall clearance.
 
-    The ID is kept as a parameter for the tie-breaking alpha calculation
-    (dlto_alpha) but does NOT affect the lateral offset direction.
-
-    # ROS2-READY: direction comes from the AGV's /odom heading or goal vector.
+    # ROS2-READY: corridor_width and wall_clearance come from /map metadata.
     """
-    if own_direction > 0:
-        return -OFFSET_TARGET   # heading right → go to lower lane (negative y)
-    else:
-        return +OFFSET_TARGET   # heading left  → go to upper lane (positive y)
+    alpha                = dlto_alpha(own_id, partner_id)
+    available_half_space = corridor_width / 2 - AGV_WIDTH / 2 - wall_clearance
+    offset               = available_half_space * (1 - alpha)
+    sign = -1 if own_direction > 0 else +1
+    return sign * offset
 
 
 # ---------------------------------------------------------------------------

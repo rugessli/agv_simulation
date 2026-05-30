@@ -46,7 +46,7 @@ from agv_model import (
 )
 from dlto_algorithm import (
     detect_dlto_conflict, detect_sw_conflict,
-    dlto_target_offset, passed, distance, OFFSET_TARGET,
+    dlto_target_offset, passed, distance,
 )
 
 
@@ -130,30 +130,28 @@ def make_scenario(name: str, seed: int) -> List[AGVState]:
     jx = float(rng.uniform(-0.05, 0.05))
 
     # -----------------------------------------------------------------------
-    # FIX: Scenarios A and B now start AGVs in their proper lanes.
-    #   AGV0 (heading right, direction=+1) starts in LOWER lane y = -0.375
-    #   AGV1 (heading left,  direction=-1) starts in UPPER lane y = +0.375
-    # This matches the two-lane traffic-rule layout used in Scenario C and
-    # is consistent with dlto_target_offset() which offsets heading-right
-    # AGVs to negative y and heading-left AGVs to positive y.
+    # Scenarios A and B: all AGVs start on the centre line (y = 0) heading
+    # directly toward each other so that a true head-on deadlock is forced.
+    # DLTO resolves it by dynamically computing lateral offsets from the
+    # corridor geometry; SW cannot (it only WAITs, blocking the centre line).
     # -----------------------------------------------------------------------
     if name == "A":
         return [
-            AGVState(aid=0, x=0.5 + jx, y=LANE_LOWER_Y + jy * 0.2,
+            AGVState(aid=0, x=0.5 + jx, y=0.0,
                      theta=0.0,     direction=+1),
-            AGVState(aid=1, x=9.5 + jx, y=LANE_UPPER_Y + jy * 0.2,
+            AGVState(aid=1, x=9.5 - jx, y=0.0,
                      theta=math.pi, direction=-1),
         ]
 
     if name == "B":
         return [
-            AGVState(aid=0, x=0.5 + jx, y=LANE_LOWER_Y + jy * 0.2,
+            AGVState(aid=0, x=0.5 + jx, y=0.0,
                      theta=0.0,     direction=+1),
-            AGVState(aid=1, x=1.5 + jx, y=LANE_LOWER_Y - jy * 0.2,
+            AGVState(aid=1, x=1.5 + jx, y=0.0,
                      theta=0.0,     direction=+1),
-            AGVState(aid=2, x=9.5 - jx, y=LANE_UPPER_Y + jy * 0.2,
+            AGVState(aid=2, x=9.5 - jx, y=0.0,
                      theta=math.pi, direction=-1),
-            AGVState(aid=3, x=8.5 - jx, y=LANE_UPPER_Y - jy * 0.2,
+            AGVState(aid=3, x=8.5 - jx, y=0.0,
                      theta=math.pi, direction=-1),
         ]
 
@@ -217,36 +215,46 @@ def find_sw_blocker(agv: AGVState, agvs: List[AGVState]) -> Optional[AGVState]:
 def step_dlto(agvs: List[AGVState], t: float,
               pair_times: dict) -> None:
     """Each AGV picks the closest opposing AGV inside DLTO radius and
-    commits to an offset lane.  After passing the partner the target_y is
-    held — the AGV does NOT drift back to centre.
+    commits to a dynamically computed offset lane.  The offset is derived
+    from the actual corridor width, AGV body dimensions, wall clearance, and
+    the AGV's priority weight (alpha) — NOT a hardcoded constant.
 
-    FIX: dlto_target_offset now receives agv.direction so offset direction
-    is determined by travel direction (keep-right rule), not by AGV ID.
+    While the lateral error is large (> 5 cm) the AGV uses SLOW_SPEED so
+    it completes the lane-change manoeuvre before the two bodies are adjacent.
+    Once within 5 cm of target_y it resumes normal speed.
     """
     for a in agvs:
         if a.arrived:
             continue
         partner = find_dlto_partner(a, agvs)
         if partner is not None:
-            # FIXED: pass a.direction so heading-right → negative y,
-            #        heading-left → positive y  (keep-right traffic rule)
-            a.target_y = dlto_target_offset(a.aid, partner.aid, a.direction)
+            a.target_y = dlto_target_offset(
+                a.aid, partner.aid, a.direction, CORRIDOR_WIDTH)
             key = tuple(sorted((a.aid, partner.aid)))
             pt = pair_times.setdefault(key, {"detect": t, "resolved": None})
             if pt["resolved"] is None and passed(a, partner):
                 pt["resolved"] = t
-        a.state = "RUN"          # SW-style waiting is never used in DLTO
+            # Slow forward speed while performing the lateral offset so the
+            # bodies are well clear before passing (SLOW = 0.4 m/s).
+            if abs(a.target_y - a.y) > 0.05:
+                a.state = "SLOW"
+            else:
+                a.state = "RUN"
+        else:
+            a.state = "RUN"
 
 
 def step_sw(agvs: List[AGVState], t: float,
             pair_times: dict) -> None:
-    """All AGVs hold the centreline.  In any predicted head-on conflict
-    (within 1.5 m) the higher-ID (lower-priority) AGV WAITs."""
+    """All AGVs hold the centre line (y = 0) with no lateral offset.
+    In any head-on conflict (within 1.5 m) the higher-ID AGV WAITs.
+    Because SW applies no lateral offset, the waiting AGV blocks the
+    centre line and the lower-ID AGV cannot pass → deadlock is NOT resolved.
+    """
     for a in agvs:
         if a.arrived:
             continue
-        # SW holds each AGV in its lane, not the centre line
-        a.target_y = LANE_LOWER_Y if a.direction > 0 else LANE_UPPER_Y
+        a.target_y = 0.0        # centre line — SW has no lateral negotiation
         a.state = "RUN"
 
     for a in agvs:
