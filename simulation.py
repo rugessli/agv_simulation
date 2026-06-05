@@ -1,38 +1,3 @@
-"""
-simulation.py
-=============
-Scenario definitions and the main simulation loop.
-
-What it does
-------------
-  * `make_scenario(name, seed)` — produces a list of `AGVState` for
-        scenario A (2 AGVs head-on) or B (4 AGVs head-on), with a small
-        per-replication position jitter seeded by `seed`.
-  * `step_dlto` / `step_sw` — per-tick decision steps that consult
-        `dlto_algorithm.py` and set `target_y` / `state` for each AGV.
-  * `run_scenario(name, algo, seed)` — drives the tick loop, applies
-        controllers, integrates motion, halts on collision, records the
-        trajectory and per-pair detection / pass times.
-
-ROS2 migration notes
---------------------
-ROS2-READY :
-  - `step_dlto`, `step_sw`            (decision logic, no I/O)
-  - `find_dlto_partner`, `find_sw_blocker`
-  - `pairwise_min_obb_distance`       (kinematic-only, reusable)
-
-ROS2-REPLACE :
-  - `run_scenario`                    — in ROS2 each AGV is its own node and
-                                         the loop is `rclpy.spin(...)`.  Move
-                                         the per-tick body into a timer
-                                         callback inside the AGV node.
-  - `make_scenario`                   — pose initialisation in ROS2 comes
-                                         from `/gazebo/spawn_entity` or a
-                                         launch file, not from Python.
-  - The collision-bisection safe-step here is a stand-in for Gazebo physics;
-    delete it when migrating to a real physics engine.
-"""
-
 from __future__ import annotations
 import math
 import copy
@@ -40,150 +5,93 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from config import (
+    AGV_LENGTH, AGV_WIDTH, CRUISE_SPEED, APPROACH_SPEED, OFFSET_SPEED, CREEP_SPEED,
+    WALL_CLEARANCE, CORRIDOR_LENGTH, DT, T_MAX, T_DEAD,
+    D_CLEAR, D_MIN, AGV_MAX_PAYLOAD, AGV_MIN_TURN_R,
+    DETECT_RANGE, DLTO_PLAN_RANGE,
+)
 from agv_model import (
-    AGVState, AGV_LENGTH, AGV_WIDTH, MAX_SPEED, OFFSET_SPEED, SLOW_SPEED,
-    WALL_LIMIT, integrate, steering_omega, has_arrived, corners, Obstacle,
+    AGVState, integrate, steering_omega, has_arrived, corners,
 )
 from dlto_algorithm import (
     detect_dlto_conflict, detect_sw_conflict,
-    dlto_target_offset, passed, distance,
+    dlto_target_offset, dlto_feasible, passed, distance,
+    find_obstacle_in_path, obstacle_avoidance_target,
 )
+from orca_algorithm import orca_step
+from flc_orca_algorithm import flc_orca_step
 
-
-# ---------------------------------------------------------------------------
-# Scenario-C lane geometry (traffic-rule style)
-# ---------------------------------------------------------------------------
-LANE_UPPER_Y     = +0.375     # AGV1 cruising lane (heading left)
-LANE_LOWER_Y     = -0.375     # AGV0 cruising lane (heading right)
-BYPASS_LEAD      = 3.5        # start dodging this many m before the obstacle
-BYPASS_TAIL      = 1.5        # rejoin the lane this many m after the obstacle
-
-
-# ---------------------------------------------------------------------------
-# Scenario-C catalogue — three obstacle positions
-# ---------------------------------------------------------------------------
-SCENARIO_C_CONFIGS = {
-    "C_TOP": {
-        "obstacle":      ((4.8, 5.2), (+0.60, +0.75)),
-        "agv0_detour_y": None,          # AGV0's lane is clear
-        "agv1_detour_y": +0.27,         # body top +0.57, 3 cm below obstacle
-        "label":         "obstacle on TOP wall",
-    },
-    "C_BOT": {
-        "obstacle":      ((4.8, 5.2), (-0.75, -0.60)),
-        "agv0_detour_y": -0.27,         # body bot −0.57, 3 cm above obstacle
-        "agv1_detour_y": None,
-        "label":         "obstacle on BOTTOM wall",
-    },
-    "C_MID": {
-        "obstacle":      ((4.8, 5.2), (-0.10, +0.10)),
-        "agv0_detour_y": -0.42,         # squeezes to lower wall
-        "agv1_detour_y": +0.42,         # squeezes to upper wall
-        "label":         "obstacle on CENTRE line",
-    },
-}
-
-
-def _scenario_c_lane_y(agv: AGVState) -> float:
-    """ROS2-READY: AGV's nominal cruising y under the lane discipline."""
-    return LANE_UPPER_Y if agv.direction < 0 else LANE_LOWER_Y
-
-
-def _agv_in_obstacle_corridor(agv: AGVState, obs: Obstacle) -> bool:
-    """ROS2-READY: is this AGV physically near the obstacle in x?
-    Lead distance is applied on the side the AGV is approaching from,
-    tail distance on the side it is leaving toward."""
-    if agv.direction > 0:
-        return obs.x_min - BYPASS_LEAD <= agv.x <= obs.x_max + BYPASS_TAIL
-    return obs.x_min - BYPASS_TAIL <= agv.x <= obs.x_max + BYPASS_LEAD
-
-
-def _needs_bypass(agv: AGVState, obstacles, lane_y: float) -> bool:
-    """ROS2-READY: should `agv` deviate from its lane because of an obstacle?"""
-    for o in obstacles:
-        if (o.cx - agv.x) * agv.direction < -o.length / 2 - BYPASS_TAIL:
-            continue
-        if _agv_in_obstacle_corridor(agv, o) and o.blocks_lane(lane_y):
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Simulation-wide constants
-# ---------------------------------------------------------------------------
-CORRIDOR_LENGTH = 10.0
-CORRIDOR_WIDTH  = 1.5            # walls at y = ±0.75
-HALF_W          = CORRIDOR_WIDTH / 2.0   # 0.75
-DT              = 0.05
-MAX_SIM_TIME    = 30.0
-DEADLOCK_WINDOW = 10.0           # DRR: resolved within 10 s of detection
-
-SIM_TIME_LIMIT = MAX_SIM_TIME   # back-compat alias
+MAX_SIM_TIME   = T_MAX
+DEADLOCK_WINDOW = T_DEAD
 
 
 # ===========================================================================
-# Scenario factory — ROS2-REPLACE
+# Scenario factory
 # ===========================================================================
-def make_scenario(name: str, seed: int) -> List[AGVState]:
+def _assign_payload(agv: AGVState, profile: str, rng) -> None:
+    if profile == "unloaded":
+        agv.cargo_state  = False
+        agv.payload_mass = 0.0
+    elif profile == "loaded":
+        agv.cargo_state  = True
+        agv.payload_mass = float(rng.uniform(500, AGV_MAX_PAYLOAD))
+    else:  # mixed / obstacle variants: 50% loaded
+        if rng.random() < 0.5:
+            agv.cargo_state  = True
+            agv.payload_mass = float(rng.uniform(500, AGV_MAX_PAYLOAD))
+        else:
+            agv.cargo_state  = False
+            agv.payload_mass = 0.0
+
+
+def make_scenario(n_agv: int, seed: int,
+                  corridor_width: float, corridor_length: float,
+                  payload_profile: str) -> List[AGVState]:
     rng = np.random.default_rng(seed)
-    jy = float(rng.uniform(-0.02, 0.02))      # tiny y jitter per replication
-    jx = float(rng.uniform(-0.05, 0.05))
+    agvs = []
+    half_right = n_agv // 2
+    half_left  = n_agv - half_right
 
-    # -----------------------------------------------------------------------
-    # Scenarios A and B: all AGVs start on the centre line (y = 0) heading
-    # directly toward each other so that a true head-on deadlock is forced.
-    # DLTO resolves it by dynamically computing lateral offsets from the
-    # corridor geometry; SW cannot (it only WAITs, blocking the centre line).
-    # -----------------------------------------------------------------------
-    if name == "A":
-        return [
-            AGVState(aid=0, x=0.5 + jx, y=0.0,
-                     theta=0.0,     direction=+1),
-            AGVState(aid=1, x=9.5 - jx, y=0.0,
-                     theta=math.pi, direction=-1),
-        ]
+    start_gap = max(AGV_LENGTH + 0.5, 3.0)
+    right_starts = [0.5 + i * start_gap for i in range(half_right)]
+    left_starts  = [corridor_length - 0.5 - i * start_gap for i in range(half_left)]
 
-    if name == "B":
-        return [
-            AGVState(aid=0, x=0.5 + jx, y=0.0,
-                     theta=0.0,     direction=+1),
-            AGVState(aid=1, x=1.5 + jx, y=0.0,
-                     theta=0.0,     direction=+1),
-            AGVState(aid=2, x=9.5 - jx, y=0.0,
-                     theta=math.pi, direction=-1),
-            AGVState(aid=3, x=8.5 - jx, y=0.0,
-                     theta=math.pi, direction=-1),
-        ]
+    right_x_offset = float(rng.uniform(0.0, 2.0))
+    left_x_offset  = float(rng.uniform(0.0, 2.0))
 
-    if name in SCENARIO_C_CONFIGS:
-        return [
-            AGVState(aid=0, x=0.5 + jx, y=LANE_LOWER_Y + jy * 0.2,
-                     theta=0.0,    direction=+1),
-            AGVState(aid=1, x=9.5 + jx, y=LANE_UPPER_Y + jy * 0.2,
-                     theta=math.pi, direction=-1),
-        ]
+    y_safe = corridor_width / 2.0 - AGV_WIDTH / 2.0 - WALL_CLEARANCE - 0.05
+    y_safe = max(0.0, y_safe)
+    y_jitter = min(0.30, y_safe)
 
-    raise ValueError(f"Unknown scenario {name!r}")
+    aid = 0
+    for i, sx in enumerate(right_starts):
+        dep_delay    = float(rng.uniform(0.0, 1.0))
+        speed_factor = float(rng.uniform(0.85, 1.0))
+        jy = float(rng.uniform(-y_jitter, y_jitter))
+        agv = AGVState(aid=aid, x=sx + right_x_offset, y=jy, theta=0.0,
+                       direction=+1, corridor_length=corridor_length,
+                       departure_delay=dep_delay, speed_factor=speed_factor)
+        _assign_payload(agv, payload_profile, rng)
+        agvs.append(agv)
+        aid += 1
 
+    for i, sx in enumerate(left_starts):
+        dep_delay    = float(rng.uniform(0.0, 1.0))
+        speed_factor = float(rng.uniform(0.85, 1.0))
+        jy = float(rng.uniform(-y_jitter, y_jitter))
+        agv = AGVState(aid=aid, x=sx - left_x_offset, y=jy, theta=math.pi,
+                       direction=-1, corridor_length=corridor_length,
+                       departure_delay=dep_delay, speed_factor=speed_factor)
+        _assign_payload(agv, payload_profile, rng)
+        agvs.append(agv)
+        aid += 1
 
-def scenario_obstacles(name: str):
-    """ROS2-READY (data): obstacle list per scenario."""
-    cfg = SCENARIO_C_CONFIGS.get(name)
-    if cfg is None:
-        return []
-    (x_min, x_max), (y_min, y_max) = cfg["obstacle"]
-    return [Obstacle(x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max)]
-
-
-def _detour_target(agv: AGVState, scenario_name: str):
-    cfg = SCENARIO_C_CONFIGS.get(scenario_name)
-    if cfg is None:
-        return None
-    return cfg["agv0_detour_y"] if agv.aid == 0 else cfg["agv1_detour_y"]
+    return agvs
 
 
 # ===========================================================================
-# Partner search — ROS2-READY
+# Partner search
 # ===========================================================================
 def find_dlto_partner(agv: AGVState, agvs: List[AGVState]) -> Optional[AGVState]:
     best, best_d = None, math.inf
@@ -210,144 +118,195 @@ def find_sw_blocker(agv: AGVState, agvs: List[AGVState]) -> Optional[AGVState]:
 
 
 # ===========================================================================
-# Algorithm steps — ROS2-READY
+# Algorithm steps
 # ===========================================================================
-def step_dlto(agvs: List[AGVState], t: float,
-              pair_times: dict) -> None:
-    """Each AGV picks the closest opposing AGV inside DLTO radius and
-    commits to a dynamically computed offset lane.  The offset is derived
-    from the actual corridor width, AGV body dimensions, wall clearance, and
-    the AGV's priority weight (alpha) — NOT a hardcoded constant.
+def _dist_based_state(dist: float) -> str:
+    """Map partner distance to AGV speed state (Fix 1: four-speed ladder)."""
+    if dist <= D_CLEAR:
+        return "CREEP"
+    if dist <= DETECT_RANGE:
+        return "SLOW"
+    return "APPROACH"  # dist <= DLTO_PLAN_RANGE (partner found)
 
-    While the lateral error is large (> 5 cm) the AGV uses SLOW_SPEED so
-    it completes the lane-change manoeuvre before the two bodies are adjacent.
-    Once within 5 cm of target_y it resumes normal speed.
-    """
+
+def step_dlto(agvs: List[AGVState], t: float, pair_times: dict,
+              corridor_width: float, obstacles: list = None) -> None:
+    all_ids = [a.aid for a in agvs]
+    obstacles = obstacles or []
     for a in agvs:
         if a.arrived:
             continue
+
         partner = find_dlto_partner(a, agvs)
         if partner is not None:
-            a.target_y = dlto_target_offset(
-                a.aid, partner.aid, a.direction, CORRIDOR_WIDTH)
-            key = tuple(sorted((a.aid, partner.aid)))
-            pt = pair_times.setdefault(key, {"detect": t, "resolved": None})
-            if pt["resolved"] is None and passed(a, partner):
-                pt["resolved"] = t
-            # Slow forward speed while performing the lateral offset so the
-            # bodies are well clear before passing (SLOW = 0.4 m/s).
-            if abs(a.target_y - a.y) > 0.05:
-                a.state = "SLOW"
+            if dlto_feasible(a, partner, corridor_width, all_ids):
+                final_target = dlto_target_offset(a, partner, corridor_width, all_ids)
+            else:
+                p_a = _priority(a, all_ids)
+                p_b = _priority(partner, all_ids)
+                if p_a < p_b:
+                    a.state = "WAIT"
+                    continue
+                final_target = dlto_target_offset(a, partner, corridor_width, all_ids)
+
+            dist = distance(a, partner)
+            if dist <= DETECT_RANGE:
+                key = tuple(sorted((a.aid, partner.aid)))
+                pair_times.setdefault(key, {"detect": t, "resolved": None})
+
+            a.target_y = final_target
+            a.smooth_target_y = final_target
+
+            # Fix 1: four-speed state based on distance to partner
+            a.state = _dist_based_state(dist)
+
+            # Fix 3: wait-for-offset rule — the vehicle closer to its target
+            # holds while the lagging partner completes its lateral offset.
+            # Prevents mid-rotation tail sweeps causing MCD < D_MIN.
+            if dist <= DETECT_RANGE:
+                own_err = abs(a.target_y - a.y)
+                partner_err = abs(partner.target_y - partner.y)
+                if partner_err > 0.25 and own_err < partner_err - 0.05:
+                    a.state = "WAIT"
+
+        elif obstacles:
+            obs = find_obstacle_in_path(a, obstacles)
+            if obs is not None:
+                obs_target = obstacle_avoidance_target(a, obs, corridor_width)
+                a.target_y = obs_target
+                a.smooth_target_y = obs_target
+                dist_to_obs = (obs.cx - a.x) * a.direction
+                if dist_to_obs <= D_CLEAR:
+                    a.state = "CREEP"
+                elif dist_to_obs <= DETECT_RANGE:
+                    a.state = "SLOW"
+                else:
+                    a.state = "APPROACH"
             else:
                 a.state = "RUN"
+                a.smooth_target_y *= 0.95
+                if abs(a.smooth_target_y) < 0.005:
+                    a.smooth_target_y = 0.0
+                a.target_y = a.smooth_target_y
+
         else:
             a.state = "RUN"
+            a.smooth_target_y *= 0.95
+            if abs(a.smooth_target_y) < 0.005:
+                a.smooth_target_y = 0.0
+            a.target_y = a.smooth_target_y
 
 
-def step_sw(agvs: List[AGVState], t: float,
-            pair_times: dict) -> None:
-    """All AGVs hold the centre line (y = 0) with no lateral offset.
-    In any head-on conflict (within 1.5 m) the higher-ID AGV WAITs.
-    Because SW applies no lateral offset, the waiting AGV blocks the
-    centre line and the lower-ID AGV cannot pass → deadlock is NOT resolved.
-    """
+def _priority(agv, all_ids):
+    from config import PRIORITY_ALPHA, PRIORITY_BETA, PRIORITY_GAMMA
+    c_i = 1.0 if agv.cargo_state else 0.0
+    m_norm = agv.payload_mass / AGV_MAX_PAYLOAD
+    id_norm = agv.aid / max(all_ids) if max(all_ids) > 0 else 0.0
+    return PRIORITY_ALPHA * c_i + PRIORITY_BETA * m_norm + PRIORITY_GAMMA * (1.0 - id_norm)
+
+
+def step_sw(agvs: List[AGVState], t: float, pair_times: dict,
+            obstacles: list = None) -> None:
+    # SW only has CRUISE and STOP — no intermediate speeds
+    obstacles = obstacles or []
     for a in agvs:
         if a.arrived:
             continue
-        a.target_y = 0.0        # centre line — SW has no lateral negotiation
+        a.target_y = 0.0
         a.state = "RUN"
-
     for a in agvs:
         if a.arrived:
             continue
         b = find_sw_blocker(a, agvs)
         if b is not None:
             key = tuple(sorted((a.aid, b.aid)))
-            pt = pair_times.setdefault(key, {"detect": t, "resolved": None})
+            pair_times.setdefault(key, {"detect": t, "resolved": None})
             if a.aid > b.aid:
                 a.state = "WAIT"
+        elif obstacles:
+            for obs in obstacles:
+                dx = (obs.cx - a.x) * a.direction
+                if 0.0 < dx <= DETECT_RANGE:
+                    agv_half = AGV_WIDTH / 2.0
+                    if abs(obs.cy - a.y) < (agv_half + obs.width / 2.0 + 0.10):
+                        a.state = "WAIT"
+                        break
+
+
+def _apply_following_distance(agvs: List[AGVState]) -> None:
+    """Enforce minimum following gap for same-direction AGVs.
+
+    Fix 3: larger gap required when leader is executing lateral offset
+    (body rotation sweeps tail toward follower).
+    Fix 4: encounter-zone serialisation forces follower to WAIT at zone
+    entry when a same-direction leader is actively offsetting inside.
+    """
+    safe_gap  = AGV_LENGTH + D_MIN          # 2.65 m centre-to-centre minimum
+    zone_lo   = CORRIDOR_LENGTH / 3.0       # ~13.3 m
+    zone_hi   = 2.0 * CORRIDOR_LENGTH / 3.0 # ~26.7 m
+    # Extra gap to accommodate body-rotation tail sweep during lateral offset
+    offset_extra = AGV_LENGTH               # 2.35 m → total 5.0 m when offsetting
+
+    live = [a for a in agvs if not a.arrived]
+    for a in live:
+        if a.state == "WAIT":
+            continue
+
+        # --- Find nearest same-direction leader (ahead of a) ---
+        nearest_leader = None
+        min_x_rel = math.inf
+        for b in live:
+            if b is a or b.arrived or b.direction != a.direction:
+                continue
+            x_rel = (b.x - a.x) * a.direction
+            if 0 < x_rel < min_x_rel:
+                nearest_leader = b
+                min_x_rel = x_rel
+
+        if nearest_leader is not None:
+            b = nearest_leader
+            x_rel = min_x_rel
+            offsetting = abs(b.target_y) > 0.05
+            gap = safe_gap + (offset_extra if offsetting else 0.0)
+            if x_rel < gap:
+                if x_rel < AGV_LENGTH + 0.10:
+                    a.state = "WAIT"
+                elif x_rel < safe_gap:
+                    a.state = "WAIT" if a.state in ("CREEP",) else "CREEP"
+                else:
+                    # Maintain CREEP while closing the extended gap during offset
+                    if a.state not in ("WAIT", "CREEP"):
+                        a.state = "CREEP"
+                continue
+
+        # --- Fix 4: encounter-zone serialisation ---
+        # If a same-direction leader is ACTIVELY offsetting inside the zone
+        # (not itself stuck in WAIT), slow the follower at zone entry.
+        # Skip if leader is WAIT — means leader is stuck waiting for its OWN
+        # partner; forcing the follower to also WAIT would deadlock 4-AGV.
+        for b in live:
+            if b is a or b.arrived or b.direction != a.direction:
+                continue
+            x_rel = (b.x - a.x) * a.direction
+            if x_rel <= 0:
+                continue
+            if (zone_lo <= b.x <= zone_hi and abs(b.target_y) > 0.05
+                    and b.state not in ("WAIT",)):
+                dist_to_zone = (
+                    (zone_lo - a.x) if a.direction > 0 else (a.x - zone_hi))
+                # Only queue at zone ENTRY (approaching from outside).
+                # If follower is already inside the zone (dist_to_zone < 0),
+                # it has its own crossing underway — don't restrict it.
+                if 0.0 <= dist_to_zone <= AGV_LENGTH * 3:
+                    if a.state not in ("WAIT",):
+                        a.state = "CREEP"
+                break
 
 
 # ===========================================================================
-# Scenario-C step functions (lane discipline + obstacle bypass)
-# ===========================================================================
-def step_dlto_lane(agvs, obstacles, scenario_name, t,
-                   pair_times, deadlock_events):
-    """DLTO with traffic-rule lanes + scenario-specific detour."""
-    detouring = {}
-
-    for a in agvs:
-        if a.arrived:
-            continue
-        a.state = "RUN"
-        lane_y = _scenario_c_lane_y(a)
-        if _needs_bypass(a, obstacles, lane_y):
-            target = _detour_target(a, scenario_name)
-            a.target_y = target if target is not None else lane_y
-            detouring[a.aid] = True
-        else:
-            a.target_y = lane_y
-            detouring[a.aid] = False
-
-    for a in agvs:
-        if a.arrived:
-            continue
-        partner = find_dlto_partner(a, agvs)
-        if partner is None:
-            continue
-        key = tuple(sorted((a.aid, partner.aid)))
-        pt = pair_times.setdefault(key, {"detect": t, "resolved": None})
-        if pt["resolved"] is None and passed(a, partner):
-            pt["resolved"] = t
-            deadlock_events.append((t, "DEADLOCK RESOLVED"))
-
-        if (not detouring.get(a.aid, False)
-                and detouring.get(partner.aid, False)):
-            a.state = "SLOW"
-            if pt.get("slow_logged") is None:
-                pt["slow_logged"] = t
-                deadlock_events.append(
-                    (t, "DEADLOCK DETECTED - LANE CROSSING CONFLICT"))
-
-
-def step_sw_lane(agvs, obstacles, scenario_name, t,
-                 pair_times, deadlock_events):
-    """SW with traffic-rule lanes + scenario detour but NO lateral yield."""
-    for a in agvs:
-        if a.arrived:
-            continue
-        a.state = "RUN"
-        lane_y = _scenario_c_lane_y(a)
-        if _needs_bypass(a, obstacles, lane_y):
-            target = _detour_target(a, scenario_name)
-            a.target_y = target if target is not None else lane_y
-        else:
-            a.target_y = lane_y
-
-    for a in agvs:
-        if a.arrived:
-            continue
-        b = find_sw_blocker(a, agvs)
-        if b is None:
-            continue
-        key = tuple(sorted((a.aid, b.aid)))
-        pt = pair_times.setdefault(key, {"detect": t, "resolved": None})
-        if pt["resolved"] is None and passed(a, b):
-            pt["resolved"] = t
-            deadlock_events.append((t, "DEADLOCK RESOLVED"))
-        if a.aid > b.aid:
-            a.state = "WAIT"
-            if pt.get("wait_logged") is None:
-                pt["wait_logged"] = t
-                deadlock_events.append(
-                    (t, "DEADLOCK DETECTED - LANE CROSSING CONFLICT"))
-
-
-# ===========================================================================
-# Physical collision bisection (ROS2-REPLACE)
+# Collision detection
 # ===========================================================================
 def _sat_overlap(c1, c2, margin: float = 0.002) -> bool:
-    """SAT for two convex polygons."""
     polys = (c1, c2)
     for poly in polys:
         n = len(poly)
@@ -365,110 +324,47 @@ def _sat_overlap(c1, c2, margin: float = 0.002) -> bool:
 
 
 def _would_collide(agv: AGVState, v: float, omega: float, dt: float,
-                   others: List[AGVState], obstacles=()) -> bool:
+                   others: List[AGVState], corridor_half_w: float,
+                   obstacles: list = None) -> bool:
     test = AGVState(aid=agv.aid, x=agv.x, y=agv.y, theta=agv.theta,
-                    direction=agv.direction)
-    integrate(test, v, omega, dt)
-    test_corners = corners(test)
+                    direction=agv.direction,
+                    corridor_length=agv.corridor_length)
+    integrate(test, v, omega, dt, corridor_half_w)
+    test_c = corners(test)
     for b in others:
         if b is agv or b.arrived:
             continue
-        if _sat_overlap(test_corners, corners(b)):
+        if _sat_overlap(test_c, corners(b)):
             return True
-    for o in obstacles:
-        if _sat_overlap(test_corners, o.corners()):
-            return True
+    if obstacles:
+        for obs in obstacles:
+            if _sat_overlap(test_c, obs.corners()):
+                return True
     return False
 
 
 def safe_motion(agv: AGVState, v_cmd: float, omega_cmd: float, dt: float,
-                others: List[AGVState], obstacles=(),
-                wall_limit: float = WALL_LIMIT) -> None:
-    """Move `agv` safely with collision bisection."""
-    if not _would_collide(agv, v_cmd, omega_cmd, dt, others, obstacles):
-        integrate(agv, v_cmd, omega_cmd, dt, wall_limit)
+                others: List[AGVState], corridor_half_w: float,
+                obstacles: list = None) -> None:
+    if not _would_collide(agv, v_cmd, omega_cmd, dt, others, corridor_half_w, obstacles):
+        integrate(agv, v_cmd, omega_cmd, dt, corridor_half_w)
         return
     lo, hi = 0.0, v_cmd
     for _ in range(8):
         mid = 0.5 * (lo + hi)
-        if _would_collide(agv, mid, omega_cmd, dt, others, obstacles):
+        if _would_collide(agv, mid, omega_cmd, dt, others, corridor_half_w, obstacles):
             hi = mid
         else:
             lo = mid
     if lo > 0.05:
-        integrate(agv, lo, omega_cmd, dt, wall_limit)
+        integrate(agv, lo, omega_cmd, dt, corridor_half_w)
         return
-    if not _would_collide(agv, 0.0, omega_cmd, dt, others, obstacles):
-        integrate(agv, 0.0, omega_cmd, dt, wall_limit)
+    if not _would_collide(agv, 0.0, omega_cmd, dt, others, corridor_half_w, obstacles):
+        integrate(agv, 0.0, omega_cmd, dt, corridor_half_w)
     else:
-        integrate(agv, 0.0, 0.0, dt, wall_limit)
+        integrate(agv, 0.0, 0.0, dt, corridor_half_w)
 
 
-# ===========================================================================
-# Visual safety guard — ensures no visual overlap in recorded trajectory
-# ===========================================================================
-def obb_corners(x, y, heading):
-    """Return OBB corners for a given pose."""
-    c, s = math.cos(heading), math.sin(heading)
-    l2, w2 = AGV_LENGTH / 2.0, AGV_WIDTH / 2.0
-    local = ((l2, w2), (l2, -w2), (-l2, -w2), (-l2, w2))
-    return [(x + lx * c - ly * s, y + lx * s + ly * c) for lx, ly in local]
-
-
-def sat_overlap(c1, c2, tol: float = 0.0) -> bool:
-    """SAT overlap check with tolerance."""
-    polys = (c1, c2)
-    for poly in polys:
-        n = len(poly)
-        for i in range(n):
-            edge = (poly[(i+1) % n][0] - poly[i][0],
-                    poly[(i+1) % n][1] - poly[i][1])
-            axis = (-edge[1], edge[0])
-            mag = math.hypot(*axis) or 1.0
-            ax, ay = axis[0]/mag, axis[1]/mag
-            p1 = [pt[0]*ax + pt[1]*ay for pt in c1]
-            p2 = [pt[0]*ax + pt[1]*ay for pt in c2]
-            if max(p1) < min(p2) + tol or max(p2) < min(p1) + tol:
-                return False
-    return True
-
-
-def _visual_safety_guard(agvs: List[AGVState]) -> None:
-    """After each physical step, reduce heading of any overlapping AGV pair
-    until they no longer visually intersect (1 mm clearance)."""
-    import itertools
-    live = [a for a in agvs if not a.arrived]
-    for _sweep in range(10):
-        any_fix = False
-        for a, b in itertools.combinations(live, 2):
-            ca = obb_corners(a.x, a.y, a.heading if hasattr(a, 'heading') else a.theta)
-            cb = obb_corners(b.x, b.y, b.heading if hasattr(b, 'heading') else b.theta)
-            if not sat_overlap(ca, cb, tol=-1e-3):
-                continue
-            any_fix = True
-            # reduce b's heading toward its base
-            theta_b = b.theta
-            base_b = 0.0 if b.direction > 0 else math.pi
-            steer = math.atan2(math.sin(theta_b - base_b),
-                               math.cos(theta_b - base_b))
-            if abs(steer) >= 1e-9:
-                sign = math.copysign(1.0, steer)
-                lo2, hi2 = 0.0, abs(steer)
-                for _ in range(12):
-                    mid = 0.5 * (lo2 + hi2)
-                    if sat_overlap(obb_corners(b.x, b.y, base_b + sign * mid),
-                                   ca, tol=-1e-3):
-                        hi2 = mid
-                    else:
-                        lo2 = mid
-                b.theta = base_b + sign * lo2
-        if not any_fix:
-            break
-
-
-# ===========================================================================
-# Pairwise minimum OBB clearance — ROS2-READY
-# ===========================================================================
 def pairwise_min_obb_distance(c1, c2) -> float:
     if _sat_overlap(c1, c2, margin=0.0):
         return 0.0
@@ -491,36 +387,70 @@ def pairwise_min_obb_distance(c1, c2) -> float:
 
 
 # ===========================================================================
-# Main loop — ROS2-REPLACE
+# Obstacle helpers
 # ===========================================================================
-def run_scenario(name: str, algorithm: str, seed: int,
-                 record_trajectory: bool = False
+def make_obstacle_set(profile: str = "obstacle_mid",
+                      corridor_width: float = 3.2) -> list:
+    """Create a single obstacle at x=20 m; y depends on profile and corridor_width.
+
+    obstacle_top: y = +(corridor_width/2 - obstacle_half - WALL_CLEARANCE)  — hugs upper wall
+    obstacle_mid: y = 0                                                       — corridor centre
+    obstacle_bot: y = -(corridor_width/2 - obstacle_half - WALL_CLEARANCE)  — hugs lower wall
+    """
+    from agv_model import Obstacle
+    obstacle_half = 0.25   # half-size of 0.5 m obstacle
+    cx = CORRIDOR_LENGTH / 2.0  # fixed at corridor midpoint = 20.0 m
+    y_hugs_wall = corridor_width / 2.0 - obstacle_half - WALL_CLEARANCE
+    cy_map = {
+        "obstacle_top": +y_hugs_wall,
+        "obstacle_mid":  0.0,
+        "obstacle_bot": -y_hugs_wall,
+        "obstacle":      0.0,
+    }
+    cy = cy_map.get(profile, 0.0)
+    return [Obstacle(x_min=cx - obstacle_half, x_max=cx + obstacle_half,
+                     y_min=cy - obstacle_half, y_max=cy + obstacle_half)]
+
+
+# ===========================================================================
+# Main loop
+# ===========================================================================
+def run_scenario(n_agv: int, algorithm: str, seed: int,
+                 corridor_width: float = 3.2,
+                 corridor_length: float = CORRIDOR_LENGTH,
+                 payload_profile: str = "unloaded",
+                 record_trajectory: bool = False,
+                 obstacles: list = None,
                  ) -> Tuple[List[AGVState], Optional[List], float,
-                            dict, float, float, list, list]:
-    agvs = make_scenario(name, seed)
-    obstacles = scenario_obstacles(name)
-    wall_limit = WALL_LIMIT
+                            dict, float, float, list]:
+
+    agvs = make_scenario(n_agv, seed, corridor_width, corridor_length,
+                         payload_profile)
+    corridor_half_w = corridor_width / 2.0
     pair_times: dict = {}
-    deadlock_events: list = []
     trajectory: list = []
     min_clearance = math.inf
     t = 0.0
-    use_lane = name in SCENARIO_C_CONFIGS
+
+    if obstacles is None and payload_profile in (
+            "obstacle", "obstacle_top", "obstacle_mid", "obstacle_bot"):
+        obstacles = make_obstacle_set(payload_profile, corridor_width)
 
     while t < MAX_SIM_TIME:
-        if use_lane:
-            if algorithm == "DLTO":
-                step_dlto_lane(agvs, obstacles, name, t,
-                               pair_times, deadlock_events)
-            else:
-                step_sw_lane(agvs, obstacles, name, t,
-                             pair_times, deadlock_events)
+        if algorithm == "DLTO":
+            step_dlto(agvs, t, pair_times, corridor_width, obstacles)
+        elif algorithm == "SW":
+            step_sw(agvs, t, pair_times, obstacles)
+        elif algorithm == "ORCA":
+            orca_step(agvs, corridor_half_w, obstacles=obstacles)
+            _sync_orca_state(agvs, t, pair_times)
+        elif algorithm == "FLC_ORCA":
+            flc_orca_step(agvs, corridor_half_w, obstacles=obstacles)
+            _sync_orca_state(agvs, t, pair_times)
         else:
-            if algorithm == "DLTO":
-                step_dlto(agvs, t, pair_times)
-            else:
-                step_sw(agvs, t, pair_times)
+            raise ValueError(f"Unknown algorithm: {algorithm!r}")
 
+        # Resolve tracking
         by_id = {a.aid: a for a in agvs}
         for key, pt in pair_times.items():
             if pt["resolved"] is not None:
@@ -534,37 +464,52 @@ def run_scenario(name: str, algorithm: str, seed: int,
             if passed(a_lo, a_hi) or passed(a_hi, a_lo):
                 pt["resolved"] = t
 
+        # Fix 3+4: enforce following distance and encounter-zone serialisation
+        _apply_following_distance(agvs)
+
         for a in agvs:
             if a.arrived:
                 a.v = 0.0
                 continue
+            if t < a.departure_delay:
+                integrate(a, 0.0, 0.0, DT, corridor_half_w)
+                continue
+
+            # Fix 1: four-speed command based on state
             if a.state == "WAIT":
                 v_cmd, omega_cmd = 0.0, 0.0
+            elif a.state == "CREEP":
+                v_cmd    = CREEP_SPEED
+                omega_cmd = steering_omega(a)
             elif a.state == "SLOW":
-                v_cmd = SLOW_SPEED
+                v_cmd    = OFFSET_SPEED * a.speed_factor
                 omega_cmd = steering_omega(a)
-            else:
-                if abs(a.target_y - a.y) > 0.02:
-                    v_cmd = OFFSET_SPEED
-                else:
-                    v_cmd = MAX_SPEED
+            elif a.state == "APPROACH":
+                v_cmd    = APPROACH_SPEED * a.speed_factor
                 omega_cmd = steering_omega(a)
-            safe_motion(a, v_cmd, omega_cmd, DT, agvs, obstacles, wall_limit)
-            _visual_safety_guard(agvs)
+            else:  # RUN
+                v_cmd    = CRUISE_SPEED * a.speed_factor
+                omega_cmd = steering_omega(a)
+
+            safe_motion(a, v_cmd, omega_cmd, DT, agvs, corridor_half_w, obstacles)
 
             if has_arrived(a):
                 a.arrived = True
                 a.arrival_time = t
 
         live = [a for a in agvs if not a.arrived]
+        # MCD: counter-direction (head-on) pairs only
         for i in range(len(live)):
             for j in range(i + 1, len(live)):
+                if live[i].direction == live[j].direction:
+                    continue
                 d = pairwise_min_obb_distance(corners(live[i]), corners(live[j]))
                 if d < min_clearance:
                     min_clearance = d
 
         if record_trajectory:
-            trajectory.append((t, [(a.x, a.y, a.theta, a.state, a.arrived)
+            trajectory.append((t, [(a.x, a.y, a.theta, a.state, a.arrived,
+                                    a.cargo_state, a.target_y)
                                    for a in agvs]))
 
         if all(a.arrived for a in agvs):
@@ -574,7 +519,7 @@ def run_scenario(name: str, algorithm: str, seed: int,
     makespan = max((a.arrival_time for a in agvs if a.arrived), default=t)
     total_dist = sum(a.distance_travelled for a in agvs)
     if math.isinf(min_clearance):
-        min_clearance = HALF_W
+        min_clearance = corridor_half_w
 
     return (agvs,
             trajectory if record_trajectory else None,
@@ -582,7 +527,17 @@ def run_scenario(name: str, algorithm: str, seed: int,
             pair_times,
             min_clearance,
             total_dist,
-            obstacles,
-            deadlock_events)
+            [])
 
 
+def _sync_orca_state(agvs: list, t: float, pair_times: dict) -> None:
+    """Mark ORCA head-on conflicts in pair_times for metric tracking."""
+    live = [a for a in agvs if not a.arrived]
+    for i, a in enumerate(live):
+        for b in live[i+1:]:
+            if a.direction == b.direction:
+                continue
+            d = math.hypot(a.x - b.x, a.y - b.y)
+            if d <= DETECT_RANGE:
+                key = tuple(sorted((a.aid, b.aid)))
+                pair_times.setdefault(key, {"detect": t, "resolved": None})

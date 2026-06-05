@@ -1,68 +1,27 @@
-"""
-dlto_algorithm.py
-=================
-Core DLTO (Dynamic Lateral Trajectory Offset) decision logic.
-
-What it does
-------------
-Pure functions that, given the kinematic state of two AGVs, decide:
-  * whether they are in a head-on conflict (DLTO 4 m / SW 1.5 m radius),
-  * which side each one should offset to (travel direction determines lane),
-  * when the pair has "passed" each other (longitudinal separation > 1 m).
-
-This module deliberately holds *no* simulation state — no time, no integrator,
-no ROS handles.  It is the analytic kernel of the planner.
-
-ROS2 migration notes
---------------------
-ROS2-READY: every function in this file.  Drop the module straight into a
-            planner node; call it from the subscriber callback that receives
-            neighbour poses from `/tf` or `/agv_states`.
-ROS2-REPLACE: nothing here needs replacement.
-"""
-
 from __future__ import annotations
 import math
 from typing import Protocol
 
-from agv_model import AGV_WIDTH
+from config import (
+    AGV_WIDTH, WALL_CLEARANCE, DETECT_RANGE, DLTO_PLAN_RANGE,
+    PRIORITY_ALPHA, PRIORITY_BETA, PRIORITY_GAMMA, AGV_MAX_PAYLOAD,
+)
+
+ANGLE_DIFF_THRESHOLD = math.radians(150.0)
+PASS_LONG_THRESHOLD  = 1.0
 
 
-# ---------------------------------------------------------------------------
-# Tunable parameters (would live in a ROS2 parameter server)
-# ---------------------------------------------------------------------------
-DETECT_RADIUS_DLTO   = 7.0                  # metres — must be large enough for
-                                            # AGVs starting at y=0 to complete
-                                            # the lateral offset manoeuvre
-                                            # before they are physically adjacent
-DETECT_RADIUS_SW     = 1.5                  # metres
-ANGLE_DIFF_THRESHOLD = math.radians(150.0)  # head-on if |Δθ| > 150°
-WALL_CLEARANCE       = 0.08                 # minimum AGV-body-to-wall gap, m
-OFFSET_TARGET        = 0.40                 # kept for backward compatibility;
-                                            # dlto_target_offset now derives
-                                            # the offset dynamically
-WALL_LIMIT           = 0.45                 # AGV centre may never exceed |y|
-PASS_LONG_THRESHOLD  = 1.0                  # longitudinal sep to call "passed"
-
-
-# ---------------------------------------------------------------------------
-# A minimal protocol that any AGV-state container must satisfy.  Both our
-# `AGVState` dataclass and a ROS2 message wrapper can implement this — the
-# functions below don't care which.
-# ---------------------------------------------------------------------------
 class PoseLike(Protocol):
-    aid:       int
-    x:         float
-    y:         float
-    theta:     float
-    direction: int      # +1 heading right, -1 heading left
+    aid:          int
+    x:            float
+    y:            float
+    theta:        float
+    direction:    int
+    cargo_state:  bool
+    payload_mass: float
 
 
-# ---------------------------------------------------------------------------
-# Geometric / conflict primitives — ROS2-READY
-# ---------------------------------------------------------------------------
 def heading_difference(theta_a: float, theta_b: float) -> float:
-    """Absolute heading difference, normalised to [0, π]."""
     d = (theta_a - theta_b + math.pi) % (2.0 * math.pi) - math.pi
     return abs(d)
 
@@ -76,66 +35,136 @@ def distance(a: PoseLike, b: PoseLike) -> float:
 
 
 def detect_dlto_conflict(own: PoseLike, partner: PoseLike) -> bool:
-    return is_head_on(own.theta, partner.theta) \
-       and distance(own, partner) <= DETECT_RADIUS_DLTO
+    # Use direction attribute (not heading angle) so detection works correctly
+    # even when vehicles are tilted during lateral offset execution.
+    return (own.direction != partner.direction) \
+       and distance(own, partner) <= DLTO_PLAN_RANGE
 
 
 def detect_sw_conflict(own: PoseLike, partner: PoseLike) -> bool:
-    return is_head_on(own.theta, partner.theta) \
-       and distance(own, partner) <= DETECT_RADIUS_SW
+    return (own.direction != partner.direction) \
+       and distance(own, partner) <= DETECT_RANGE
 
 
-# ---------------------------------------------------------------------------
-# Priority + offset assignment — ROS2-READY
-# ---------------------------------------------------------------------------
-def dlto_alpha(own_id: int, partner_id: int) -> float:
-    """Priority weight used in the dynamic offset formula.
+def _priority_score(agv: PoseLike, all_ids) -> float:
+    c_i = 1.0 if agv.cargo_state else 0.0
+    m_norm = agv.payload_mass / AGV_MAX_PAYLOAD
+    id_norm = agv.aid / max(all_ids) if max(all_ids) > 0 else 0.0
+    return PRIORITY_ALPHA * c_i + PRIORITY_BETA * m_norm + PRIORITY_GAMMA * (1.0 - id_norm)
 
-    Higher priority (lower ID) → alpha = 0.10 → less lateral yield
-                                          (offset = 0.90 × available_half_space)
-    Lower priority (higher ID) → alpha = 0.00 → full lateral yield
-                                          (offset = 1.00 × available_half_space)
 
-    Values are chosen so that (1 − alpha) × available_half_space ≥ AGV_WIDTH / 2
-    in any corridor ≥ 1.4 m, guaranteeing the two body envelopes clear each other.
+def dlto_target_offset(own: PoseLike, partner: PoseLike,
+                       corridor_width: float,
+                       all_ids=None) -> float:
+    """Compute lateral target y for `own` when negotiating with `partner`.
+
+    Layer 1: priority-based raw split — high priority gets small offset.
+    Layer 2: safety compensation — guarantee projected body gap >= D_MIN.
     """
-    return 0.10 if own_id < partner_id else 0.00
+    from config import D_MIN
+
+    if all_ids is None:
+        all_ids = [own.aid, partner.aid]
+
+    p_i = _priority_score(own, all_ids)
+    p_j = _priority_score(partner, all_ids)
+    total = p_i + p_j
+
+    # offset_coeff in [0,1]: 0 → high priority (small offset), 1 → low priority
+    offset_coeff_i = p_j / total if total >= 1e-9 else 0.5
+
+    available_space = max(0.0, corridor_width / 2.0 - AGV_WIDTH / 2.0 - WALL_CLEARANCE)
+
+    # Layer 1: guaranteed minimum base + priority-scaled extra space.
+    # min_off ensures each vehicle provides at least half the required gap.
+    # sym_delta is the symmetric (ORCA-equivalent) baseline that guarantees
+    # safe dynamic clearance during the lateral approach; priority can only
+    # ADD extra offset for low-priority vehicles, never remove from baseline.
+    min_off    = min((AGV_WIDTH + D_MIN) / 2.0, available_space)
+    range_space = max(0.0, available_space - min_off)
+    sym_delta  = min_off + 0.5 * range_space        # symmetric baseline
+
+    if range_space < D_MIN:
+        # Corridor too narrow for meaningful priority differentiation:
+        # asymmetric targets cause timing divergence that can violate D_MIN.
+        # Fall back to symmetric baseline so both vehicles behave like ORCA.
+        delta_i = sym_delta
+        delta_j = sym_delta
+    else:
+        raw_i = min_off + offset_coeff_i * range_space
+        raw_j = min_off + (1.0 - offset_coeff_i) * range_space
+        delta_i = max(sym_delta, raw_i)   # floor at sym; low-prio can go higher
+        delta_j = max(sym_delta, raw_j)
+
+    # Layer 2: safety check — catches extreme narrow corridors where
+    # available_space < min_off so Layer 1 alone may leave gap < D_MIN.
+    projected_gap = (delta_i + delta_j) - AGV_WIDTH
+    if projected_gap < D_MIN:
+        shortage = D_MIN - projected_gap
+        remaining_i = available_space - delta_i
+        remaining_j = available_space - delta_j
+        total_remaining = remaining_i + remaining_j
+        if total_remaining > 1e-9:
+            delta_i += shortage * (remaining_i / total_remaining)
+            delta_j += shortage * (remaining_j / total_remaining)
+        else:
+            delta_i = available_space
+            delta_j = available_space
+        delta_i = min(delta_i, available_space)
+
+    # Direction: right-going AGV moves to negative-y lane; left-going to positive-y
+    sign = -1 if own.direction > 0 else +1
+    return sign * delta_i
 
 
-def dlto_target_offset(own_id: int, partner_id: int,
-                       own_direction: int = +1,
-                       corridor_width: float = 1.5,
-                       wall_clearance: float = WALL_CLEARANCE) -> float:
-    """Dynamic lateral target derived from corridor geometry and priority weight.
-
-    Formula (self-derived, adapts when corridor width changes):
-        available_half_space = corridor_width/2 − AGV_WIDTH/2 − wall_clearance
-        offset               = available_half_space × (1 − alpha_i)
-        target_y             = −offset  (heading right)
-                             = +offset  (heading left)
-
-    Higher-priority AGV (lower ID, alpha=0.10) offsets to 90 % of available
-    half-space — keeps a slight centre-lane advantage.
-    Lower-priority AGV (higher ID, alpha=0.00) offsets to the full available
-    half-space — yields maximally while still respecting the wall clearance.
-
-    # ROS2-READY: corridor_width and wall_clearance come from /map metadata.
-    """
-    alpha                = dlto_alpha(own_id, partner_id)
-    available_half_space = corridor_width / 2 - AGV_WIDTH / 2 - wall_clearance
-    offset               = available_half_space * (1 - alpha)
-    sign = -1 if own_direction > 0 else +1
-    return sign * offset
+def dlto_feasible(own: PoseLike, partner: PoseLike,
+                  corridor_width: float, all_ids=None) -> bool:
+    """Return False if the lower-priority vehicle has no room to offset."""
+    if all_ids is None:
+        all_ids = [own.aid, partner.aid]
+    available_space = corridor_width / 2.0 - AGV_WIDTH / 2.0 - WALL_CLEARANCE
+    return available_space >= 0.0
 
 
-# ---------------------------------------------------------------------------
-# Pass-detection — ROS2-READY
-# ---------------------------------------------------------------------------
 def passed(own: PoseLike, partner: PoseLike,
            threshold: float = PASS_LONG_THRESHOLD) -> bool:
-    """True if `partner` is behind `own` in own's forward direction by
-    more than `threshold` metres."""
     fx, fy = math.cos(own.theta), math.sin(own.theta)
     rel_x, rel_y = partner.x - own.x, partner.y - own.y
     longitudinal = fx * rel_x + fy * rel_y
     return longitudinal < -threshold
+
+
+def find_obstacle_in_path(agv: PoseLike, obstacles: list,
+                          plan_range: float = DLTO_PLAN_RANGE) -> object:
+    """Return nearest Obstacle that blocks agv's forward path, or None."""
+    best_obs, best_dx = None, math.inf
+    for obs in obstacles:
+        dx = (obs.cx - agv.x) * agv.direction
+        if dx <= 0.0 or dx > plan_range:
+            continue
+        # Y-overlap: will the vehicle's path intersect the obstacle?
+        agv_half = AGV_WIDTH / 2.0
+        obs_half = obs.width / 2.0
+        if abs(obs.cy - agv.y) < (agv_half + obs_half + 0.05):
+            if dx < best_dx:
+                best_obs, best_dx = obs, dx
+    return best_obs
+
+
+def obstacle_avoidance_target(agv: PoseLike, obs,
+                              corridor_width: float) -> float:
+    """Lateral target y to bypass a static obstacle.
+
+    Keep-right rule: right-going → negative y, left-going → positive y.
+    If the obstacle is on the vehicle's natural side, detour to the other side.
+    This ensures counter-direction vehicles approach the obstacle from opposite
+    sides and don't collide with each other at the detour.
+    """
+    available = max(0.0, corridor_width / 2.0 - AGV_WIDTH / 2.0 - WALL_CLEARANCE)
+    preferred = -1 if agv.direction > 0 else +1
+    if preferred * obs.cy > 0:
+        # Obstacle is on the preferred (natural) side — detour to other side
+        sign = -preferred
+    else:
+        sign = preferred
+    return sign * available
