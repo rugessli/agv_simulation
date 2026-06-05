@@ -17,9 +17,11 @@ T_MAX            = 60.0
 T_DEAD           = 2.0
 DT               = 0.1
 CORRIDOR_LENGTH  = 40.0
-PRIORITY_ALPHA   = 0.6
-PRIORITY_BETA    = 0.3
-PRIORITY_GAMMA   = 0.1
+PRIORITY_ALPHA   = 0.40   # cargo state
+PRIORITY_BETA    = 0.20   # payload mass
+PRIORITY_GAMMA   = 0.20   # proximity to goal (less disruption near destination)
+PRIORITY_DELTA   = 0.15   # current speed (higher cost to reroute a faster vehicle)
+PRIORITY_EPSILON = 0.05   # ID tie-breaker
 
 CORRIDOR_WIDTHS  = [2.8, 3.2, 3.6]
 AGV_COUNTS       = [2, 3, 4]

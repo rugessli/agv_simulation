@@ -18,6 +18,7 @@ from dlto_algorithm import (
     detect_dlto_conflict, detect_sw_conflict,
     dlto_target_offset, dlto_feasible, passed, distance,
     find_obstacle_in_path, obstacle_avoidance_target,
+    _priority_score,
 )
 from orca_algorithm import orca_step
 from flc_orca_algorithm import flc_orca_step
@@ -129,24 +130,83 @@ def _dist_based_state(dist: float) -> str:
     return "APPROACH"  # dist <= DLTO_PLAN_RANGE (partner found)
 
 
+def _obstacle_forced_sign(agv: AGVState, obs) -> int:
+    """Return the lateral sign forced by obstacle same-side rule (+1=upper, -1=lower)."""
+    threshold = obs.width / 2.0
+    if obs.cy < -threshold:
+        return +1   # obstacle below → go upper
+    elif obs.cy > threshold:
+        return -1   # obstacle above → go lower
+    else:
+        return +1 if agv.direction > 0 else -1  # centre → split
+
+
 def step_dlto(agvs: List[AGVState], t: float, pair_times: dict,
               corridor_width: float, obstacles: list = None) -> None:
     all_ids = [a.aid for a in agvs]
     obstacles = obstacles or []
+    available = corridor_width / 2.0 - AGV_WIDTH / 2.0 - WALL_CLEARANCE
+
     for a in agvs:
         if a.arrived:
             continue
 
         partner = find_dlto_partner(a, agvs)
+
+        # ── obstacle in path? ────────────────────────────────────────────────
+        obs = find_obstacle_in_path(a, obstacles) if obstacles else None
+
         if partner is not None:
-            if dlto_feasible(a, partner, corridor_width, all_ids):
-                final_target = dlto_target_offset(a, partner, corridor_width, all_ids)
-            else:
-                p_a = _priority(a, all_ids)
-                p_b = _priority(partner, all_ids)
+            if not dlto_feasible(a, partner, corridor_width, all_ids):
+                p_a = _priority_score(a, all_ids)
+                p_b = _priority_score(partner, all_ids)
                 if p_a < p_b:
                     a.state = "WAIT"
                     continue
+
+            if obs is not None:
+                # ── combined partner + obstacle ──────────────────────────────
+                forced = _obstacle_forced_sign(a, obs)
+                forced_partner = _obstacle_forced_sign(partner, obs)
+
+                if forced == forced_partner:
+                    # Both vehicles forced to same side (obstacle_bot / obstacle_top).
+                    # Strategy B: lower-priority vehicle pulls to wall and waits;
+                    # higher-priority vehicle attempts to squeeze through the gap.
+                    p_a = _priority_score(a, all_ids)
+                    p_b = _priority_score(partner, all_ids)
+                    wall_target = forced * available
+                    if p_a < p_b:
+                        # Lower priority → pull to wall, WAIT
+                        a.target_y = wall_target
+                        a.smooth_target_y = wall_target
+                        a.state = "WAIT"
+                        continue
+                    else:
+                        # Higher priority: compute safe gap between obstacle edge
+                        # and partner's expected wall position.
+                        if forced > 0:   # both upper, obstacle below
+                            lo = obs.y_max + AGV_WIDTH / 2.0 + D_MIN
+                            hi = wall_target - AGV_WIDTH - D_MIN
+                        else:            # both lower, obstacle above
+                            hi = obs.y_min - AGV_WIDTH / 2.0 - D_MIN
+                            lo = wall_target + AGV_WIDTH + D_MIN
+                        if lo < hi:
+                            final_target = (lo + hi) / 2.0
+                        else:
+                            # Corridor too narrow — no valid passing lane.
+                            # Both vehicles must wait to prevent head-on collision.
+                            a.target_y = wall_target
+                            a.smooth_target_y = wall_target
+                            a.state = "WAIT"
+                            continue
+                else:
+                    # Opposite forced sides (centre obstacle) — apply DLTO priority
+                    # within the obstacle-forced lanes.
+                    final_target = dlto_target_offset(
+                        a, partner, corridor_width, all_ids, forced_sign=forced)
+            else:
+                # Partner only, no obstacle in path
                 final_target = dlto_target_offset(a, partner, corridor_width, all_ids)
 
             dist = distance(a, partner)
@@ -156,38 +216,27 @@ def step_dlto(agvs: List[AGVState], t: float, pair_times: dict,
 
             a.target_y = final_target
             a.smooth_target_y = final_target
-
-            # Fix 1: four-speed state based on distance to partner
             a.state = _dist_based_state(dist)
 
-            # Fix 3: wait-for-offset rule — the vehicle closer to its target
-            # holds while the lagging partner completes its lateral offset.
-            # Prevents mid-rotation tail sweeps causing MCD < D_MIN.
+            # Wait-for-offset: hold while partner is still completing its lateral move
             if dist <= DETECT_RANGE:
                 own_err = abs(a.target_y - a.y)
                 partner_err = abs(partner.target_y - partner.y)
                 if partner_err > 0.25 and own_err < partner_err - 0.05:
                     a.state = "WAIT"
 
-        elif obstacles:
-            obs = find_obstacle_in_path(a, obstacles)
-            if obs is not None:
-                obs_target = obstacle_avoidance_target(a, obs, corridor_width)
-                a.target_y = obs_target
-                a.smooth_target_y = obs_target
-                dist_to_obs = (obs.cx - a.x) * a.direction
-                if dist_to_obs <= D_CLEAR:
-                    a.state = "CREEP"
-                elif dist_to_obs <= DETECT_RANGE:
-                    a.state = "SLOW"
-                else:
-                    a.state = "APPROACH"
+        elif obs is not None:
+            # Obstacle only (no counter-direction partner nearby)
+            obs_target = obstacle_avoidance_target(a, obs, corridor_width)
+            a.target_y = obs_target
+            a.smooth_target_y = obs_target
+            dist_to_obs = (obs.cx - a.x) * a.direction
+            if dist_to_obs <= D_CLEAR:
+                a.state = "CREEP"
+            elif dist_to_obs <= DETECT_RANGE:
+                a.state = "SLOW"
             else:
-                a.state = "RUN"
-                a.smooth_target_y *= 0.95
-                if abs(a.smooth_target_y) < 0.005:
-                    a.smooth_target_y = 0.0
-                a.target_y = a.smooth_target_y
+                a.state = "APPROACH"
 
         else:
             a.state = "RUN"
@@ -196,13 +245,6 @@ def step_dlto(agvs: List[AGVState], t: float, pair_times: dict,
                 a.smooth_target_y = 0.0
             a.target_y = a.smooth_target_y
 
-
-def _priority(agv, all_ids):
-    from config import PRIORITY_ALPHA, PRIORITY_BETA, PRIORITY_GAMMA
-    c_i = 1.0 if agv.cargo_state else 0.0
-    m_norm = agv.payload_mass / AGV_MAX_PAYLOAD
-    id_norm = agv.aid / max(all_ids) if max(all_ids) > 0 else 0.0
-    return PRIORITY_ALPHA * c_i + PRIORITY_BETA * m_norm + PRIORITY_GAMMA * (1.0 - id_norm)
 
 
 def step_sw(agvs: List[AGVState], t: float, pair_times: dict,
@@ -326,16 +368,29 @@ def _sat_overlap(c1, c2, margin: float = 0.002) -> bool:
 def _would_collide(agv: AGVState, v: float, omega: float, dt: float,
                    others: List[AGVState], corridor_half_w: float,
                    obstacles: list = None) -> bool:
+    """Predict agv's next position and check against others' PREDICTED next positions.
+
+    Using others' predicted positions (not current) prevents the simultaneous-update
+    blind spot where two vehicles each see the other as stationary and both move
+    into the same cell.
+    """
     test = AGVState(aid=agv.aid, x=agv.x, y=agv.y, theta=agv.theta,
                     direction=agv.direction,
                     corridor_length=agv.corridor_length)
     integrate(test, v, omega, dt, corridor_half_w)
     test_c = corners(test)
+
     for b in others:
         if b is agv or b.arrived:
             continue
-        if _sat_overlap(test_c, corners(b)):
+        # Predict b's position one step ahead using its current velocity/omega
+        b_next = AGVState(aid=b.aid, x=b.x, y=b.y, theta=b.theta,
+                          direction=b.direction,
+                          corridor_length=b.corridor_length)
+        integrate(b_next, b.v, b.omega, dt, corridor_half_w)
+        if _sat_overlap(test_c, corners(b_next)):
             return True
+
     if obstacles:
         for obs in obstacles:
             if _sat_overlap(test_c, obs.corners()):

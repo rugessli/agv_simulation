@@ -3,8 +3,9 @@ import math
 from typing import Protocol
 
 from config import (
-    AGV_WIDTH, WALL_CLEARANCE, DETECT_RANGE, DLTO_PLAN_RANGE,
-    PRIORITY_ALPHA, PRIORITY_BETA, PRIORITY_GAMMA, AGV_MAX_PAYLOAD,
+    AGV_WIDTH, WALL_CLEARANCE, DETECT_RANGE, DLTO_PLAN_RANGE, CRUISE_SPEED,
+    PRIORITY_ALPHA, PRIORITY_BETA, PRIORITY_GAMMA,
+    PRIORITY_DELTA, PRIORITY_EPSILON, AGV_MAX_PAYLOAD,
 )
 
 ANGLE_DIFF_THRESHOLD = math.radians(150.0)
@@ -12,13 +13,15 @@ PASS_LONG_THRESHOLD  = 1.0
 
 
 class PoseLike(Protocol):
-    aid:          int
-    x:            float
-    y:            float
-    theta:        float
-    direction:    int
-    cargo_state:  bool
-    payload_mass: float
+    aid:             int
+    x:               float
+    y:               float
+    theta:           float
+    direction:       int
+    cargo_state:     bool
+    payload_mass:    float
+    v:               float
+    corridor_length: float
 
 
 def heading_difference(theta_a: float, theta_b: float) -> float:
@@ -47,15 +50,24 @@ def detect_sw_conflict(own: PoseLike, partner: PoseLike) -> bool:
 
 
 def _priority_score(agv: PoseLike, all_ids) -> float:
-    c_i = 1.0 if agv.cargo_state else 0.0
+    """5-term priority: cargo, payload, proximity-to-goal, speed, ID tie-breaker."""
+    c_i    = 1.0 if agv.cargo_state else 0.0
     m_norm = agv.payload_mass / AGV_MAX_PAYLOAD
+    goal_x = (agv.corridor_length - 0.5) if agv.direction > 0 else 0.5
+    r_norm = 1.0 - min(1.0, abs(agv.x - goal_x) / max(agv.corridor_length, 1.0))
+    v_norm = min(1.0, abs(agv.v) / CRUISE_SPEED) if CRUISE_SPEED > 0 else 0.0
     id_norm = agv.aid / max(all_ids) if max(all_ids) > 0 else 0.0
-    return PRIORITY_ALPHA * c_i + PRIORITY_BETA * m_norm + PRIORITY_GAMMA * (1.0 - id_norm)
+    return (PRIORITY_ALPHA   * c_i
+          + PRIORITY_BETA    * m_norm
+          + PRIORITY_GAMMA   * r_norm
+          + PRIORITY_DELTA   * v_norm
+          + PRIORITY_EPSILON * (1.0 - id_norm))
 
 
 def dlto_target_offset(own: PoseLike, partner: PoseLike,
                        corridor_width: float,
-                       all_ids=None) -> float:
+                       all_ids=None,
+                       forced_sign: int = None) -> float:
     """Compute lateral target y for `own` when negotiating with `partner`.
 
     Layer 1: priority-based raw split — high priority gets small offset.
@@ -112,8 +124,11 @@ def dlto_target_offset(own: PoseLike, partner: PoseLike,
             delta_j = available_space
         delta_i = min(delta_i, available_space)
 
-    # Direction: right-going AGV moves to negative-y lane; left-going to positive-y
-    sign = -1 if own.direction > 0 else +1
+    # Direction: forced_sign overrides default keep-right rule (used for obstacle scenarios)
+    if forced_sign is not None:
+        sign = forced_sign
+    else:
+        sign = -1 if own.direction > 0 else +1
     return sign * delta_i
 
 
@@ -155,16 +170,23 @@ def obstacle_avoidance_target(agv: PoseLike, obs,
                               corridor_width: float) -> float:
     """Lateral target y to bypass a static obstacle.
 
-    Keep-right rule: right-going → negative y, left-going → positive y.
-    If the obstacle is on the vehicle's natural side, detour to the other side.
-    This ensures counter-direction vehicles approach the obstacle from opposite
-    sides and don't collide with each other at the detour.
+    Same-side rule: both counter-direction vehicles detour to the obstacle-free side
+    so they share one passing lane (serialised by priority) rather than colliding
+    at the obstacle choke-point.
+
+      obs.cy < -threshold → obstacle in lower half → BOTH go upper (+1)
+      obs.cy > +threshold → obstacle in upper half → BOTH go lower (-1)
+      |obs.cy| ≤ threshold → obstacle at centre → split by direction so
+          right-going goes upper (+1), left-going goes lower (-1),
+          keeping them on opposite sides of the centre obstacle.
     """
     available = max(0.0, corridor_width / 2.0 - AGV_WIDTH / 2.0 - WALL_CLEARANCE)
-    preferred = -1 if agv.direction > 0 else +1
-    if preferred * obs.cy > 0:
-        # Obstacle is on the preferred (natural) side — detour to other side
-        sign = -preferred
+    threshold = obs.width / 2.0      # obstacle spans ±threshold from its centre
+    if obs.cy < -threshold:
+        sign = +1  # obstacle below → both upper
+    elif obs.cy > threshold:
+        sign = -1  # obstacle above → both lower
     else:
-        sign = preferred
+        # Centre obstacle: split so vehicles pass on opposite sides
+        sign = +1 if agv.direction > 0 else -1
     return sign * available

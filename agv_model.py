@@ -39,6 +39,10 @@ class AGVState:
     def goal_x(self) -> float:
         return (self.corridor_length - 0.5) if self.direction > 0 else 0.5
 
+    @property
+    def remaining_dist(self) -> float:
+        return abs(self.x - self.goal_x)
+
 
 def steering_omega(agv: AGVState) -> float:
     base = 0.0 if agv.direction > 0 else math.pi
