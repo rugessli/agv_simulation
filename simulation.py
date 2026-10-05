@@ -9,7 +9,7 @@ from config import (
     AGV_LENGTH, AGV_WIDTH, CRUISE_SPEED, APPROACH_SPEED, OFFSET_SPEED, CREEP_SPEED,
     WALL_CLEARANCE, CORRIDOR_LENGTH, DT, T_MAX, T_DEAD,
     D_CLEAR, D_MIN, AGV_MAX_PAYLOAD, AGV_MIN_TURN_R,
-    DETECT_RANGE, DLTO_PLAN_RANGE,
+    DETECT_RANGE, DLTO_PLAN_RANGE, OFFSET_RATE,
 )
 from agv_model import (
     AGVState, integrate, steering_omega, has_arrived, corners,
@@ -17,7 +17,7 @@ from agv_model import (
 from dlto_algorithm import (
     detect_dlto_conflict, detect_sw_conflict,
     dlto_target_offset, dlto_feasible, passed, distance,
-    find_obstacle_in_path, obstacle_avoidance_target,
+    obstacle_plan, obstacle_traverse_state, slower_state,
     _priority_score,
 )
 from orca_algorithm import orca_step
@@ -99,7 +99,9 @@ def find_dlto_partner(agv: AGVState, agvs: List[AGVState]) -> Optional[AGVState]
     for b in agvs:
         if b is agv or b.arrived:
             continue
-        if detect_dlto_conflict(agv, b):
+        # Once the two have crossed, b is no longer a head-on threat — dropping
+        # it lets agv return to centre instead of re-offsetting as they separate.
+        if detect_dlto_conflict(agv, b) and not passed(agv, b):
             d = distance(agv, b)
             if d < best_d:
                 best, best_d = b, d
@@ -130,22 +132,10 @@ def _dist_based_state(dist: float) -> str:
     return "APPROACH"  # dist <= DLTO_PLAN_RANGE (partner found)
 
 
-def _obstacle_forced_sign(agv: AGVState, obs) -> int:
-    """Return the lateral sign forced by obstacle same-side rule (+1=upper, -1=lower)."""
-    threshold = obs.width / 2.0
-    if obs.cy < -threshold:
-        return +1   # obstacle below → go upper
-    elif obs.cy > threshold:
-        return -1   # obstacle above → go lower
-    else:
-        return +1 if agv.direction > 0 else -1  # centre → split
-
-
 def step_dlto(agvs: List[AGVState], t: float, pair_times: dict,
               corridor_width: float, obstacles: list = None) -> None:
     all_ids = [a.aid for a in agvs]
     obstacles = obstacles or []
-    available = corridor_width / 2.0 - AGV_WIDTH / 2.0 - WALL_CLEARANCE
 
     for a in agvs:
         if a.arrived:
@@ -153,97 +143,44 @@ def step_dlto(agvs: List[AGVState], t: float, pair_times: dict,
 
         partner = find_dlto_partner(a, agvs)
 
-        # ── obstacle in path? ────────────────────────────────────────────────
-        obs = find_obstacle_in_path(a, obstacles) if obstacles else None
+        # Record the head-on encounter (for DRR / ART) when within detect range.
+        dist = distance(a, partner) if partner is not None else math.inf
+        if partner is not None and dist <= DETECT_RANGE:
+            key = tuple(sorted((a.aid, partner.aid)))
+            pair_times.setdefault(key, {"detect": t, "resolved": None})
 
-        if partner is not None:
-            if not dlto_feasible(a, partner, corridor_width, all_ids):
-                p_a = _priority_score(a, all_ids)
-                p_b = _priority_score(partner, all_ids)
-                if p_a < p_b:
-                    a.state = "WAIT"
-                    continue
+        # ── obstacle coordination governs when present ───────────────────────
+        prio = lambda x: (_priority_score(x, all_ids), -x.aid)
+        op = obstacle_plan(a, agvs, obstacles, corridor_width, prio) \
+            if obstacles else None
 
-            if obs is not None:
-                # ── combined partner + obstacle ──────────────────────────────
-                forced = _obstacle_forced_sign(a, obs)
-                forced_partner = _obstacle_forced_sign(partner, obs)
-
-                if forced == forced_partner:
-                    # Both vehicles forced to same side (obstacle_bot / obstacle_top).
-                    # Strategy B: lower-priority vehicle pulls to wall and waits;
-                    # higher-priority vehicle attempts to squeeze through the gap.
-                    p_a = _priority_score(a, all_ids)
-                    p_b = _priority_score(partner, all_ids)
-                    wall_target = forced * available
-                    if p_a < p_b:
-                        # Lower priority → pull to wall, WAIT
-                        a.target_y = wall_target
-                        a.smooth_target_y = wall_target
-                        a.state = "WAIT"
-                        continue
-                    else:
-                        # Higher priority: compute safe gap between obstacle edge
-                        # and partner's expected wall position.
-                        if forced > 0:   # both upper, obstacle below
-                            lo = obs.y_max + AGV_WIDTH / 2.0 + D_MIN
-                            hi = wall_target - AGV_WIDTH - D_MIN
-                        else:            # both lower, obstacle above
-                            hi = obs.y_min - AGV_WIDTH / 2.0 - D_MIN
-                            lo = wall_target + AGV_WIDTH + D_MIN
-                        if lo < hi:
-                            final_target = (lo + hi) / 2.0
-                        else:
-                            # Corridor too narrow — no valid passing lane.
-                            # Both vehicles must wait to prevent head-on collision.
-                            a.target_y = wall_target
-                            a.smooth_target_y = wall_target
-                            a.state = "WAIT"
-                            continue
-                else:
-                    # Opposite forced sides (centre obstacle) — apply DLTO priority
-                    # within the obstacle-forced lanes.
-                    final_target = dlto_target_offset(
-                        a, partner, corridor_width, all_ids, forced_sign=forced)
+        if op is not None:
+            tgt, wait, dist_obs = op
+            a.target_y = tgt
+            if wait:
+                a.state = "WAIT"
+                continue
+            obs_state = obstacle_traverse_state(a, dist_obs)
+            if partner is not None:
+                a.state = slower_state(_dist_based_state(dist), obs_state)
             else:
-                # Partner only, no obstacle in path
-                final_target = dlto_target_offset(a, partner, corridor_width, all_ids)
+                a.state = obs_state
 
-            dist = distance(a, partner)
-            if dist <= DETECT_RANGE:
-                key = tuple(sorted((a.aid, partner.aid)))
-                pair_times.setdefault(key, {"detect": t, "resolved": None})
-
-            a.target_y = final_target
-            a.smooth_target_y = final_target
+        elif partner is not None:
+            # Partner only, no obstacle in path
+            a.target_y = dlto_target_offset(a, partner, corridor_width, all_ids)
             a.state = _dist_based_state(dist)
 
-            # Wait-for-offset: hold while partner is still completing its lateral move
+            # Wait-for-offset: hold while partner is still completing its move
             if dist <= DETECT_RANGE:
                 own_err = abs(a.target_y - a.y)
                 partner_err = abs(partner.target_y - partner.y)
                 if partner_err > 0.25 and own_err < partner_err - 0.05:
                     a.state = "WAIT"
 
-        elif obs is not None:
-            # Obstacle only (no counter-direction partner nearby)
-            obs_target = obstacle_avoidance_target(a, obs, corridor_width)
-            a.target_y = obs_target
-            a.smooth_target_y = obs_target
-            dist_to_obs = (obs.cx - a.x) * a.direction
-            if dist_to_obs <= D_CLEAR:
-                a.state = "CREEP"
-            elif dist_to_obs <= DETECT_RANGE:
-                a.state = "SLOW"
-            else:
-                a.state = "APPROACH"
-
         else:
             a.state = "RUN"
-            a.smooth_target_y *= 0.95
-            if abs(a.smooth_target_y) < 0.005:
-                a.smooth_target_y = 0.0
-            a.target_y = a.smooth_target_y
+            a.target_y = 0.0
 
 
 
@@ -532,19 +469,28 @@ def run_scenario(n_agv: int, algorithm: str, seed: int,
 
             # Fix 1: four-speed command based on state
             if a.state == "WAIT":
-                v_cmd, omega_cmd = 0.0, 0.0
+                v_cmd = 0.0
             elif a.state == "CREEP":
-                v_cmd    = CREEP_SPEED
-                omega_cmd = steering_omega(a)
+                v_cmd = CREEP_SPEED
             elif a.state == "SLOW":
-                v_cmd    = OFFSET_SPEED * a.speed_factor
-                omega_cmd = steering_omega(a)
+                v_cmd = OFFSET_SPEED * a.speed_factor
             elif a.state == "APPROACH":
-                v_cmd    = APPROACH_SPEED * a.speed_factor
-                omega_cmd = steering_omega(a)
+                v_cmd = APPROACH_SPEED * a.speed_factor
             else:  # RUN
-                v_cmd    = CRUISE_SPEED * a.speed_factor
-                omega_cmd = steering_omega(a)
+                v_cmd = CRUISE_SPEED * a.speed_factor
+
+            # Problem 2: rate-limit the lateral command so the offset develops
+            # as a smooth arc (gentle, progressive) rather than a step input.
+            step = OFFSET_RATE * DT
+            a.smooth_target_y += max(-step, min(step,
+                                                a.target_y - a.smooth_target_y))
+
+            if a.state == "WAIT":
+                omega_cmd = 0.0
+            else:
+                omega_cmd = steering_omega(a, v=v_cmd,
+                                           corridor_half_w=corridor_half_w,
+                                           y_target=a.smooth_target_y, dt=DT)
 
             safe_motion(a, v_cmd, omega_cmd, DT, agvs, corridor_half_w, obstacles)
 

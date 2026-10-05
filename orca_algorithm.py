@@ -29,13 +29,15 @@ def _is_head_on(theta_a: float, theta_b: float) -> bool:
 
 def _lateral_target(own, partner, corridor_width: float,
                     responsibility: float) -> float:
-    """Compute lateral y-target using ORCA responsibility coefficient."""
-    available_space = corridor_width / 2.0 - AGV_WIDTH / 2.0 - WALL_CLEARANCE
-    min_offset = (AGV_WIDTH + D_MIN) / 2.0
-    available_space = max(min_offset, available_space)
+    """Compute lateral y-target using ORCA responsibility coefficient.
 
-    delta = min_offset + responsibility * max(0.0, available_space - min_offset)
-    delta = min(delta, available_space)
+    Magnitude is bounded by offset_bounds() so the body keeps TILT_RESERVE of
+    wall clearance during the transient arc (Problem 2).
+    """
+    from dlto_algorithm import offset_bounds
+    min_off, max_off, available = offset_bounds(corridor_width)
+    delta = min_off + responsibility * max(0.0, max_off - min_off)
+    delta = max(min_off, min(delta, available))
 
     sign = -1 if own.direction > 0 else +1
     return sign * delta
@@ -63,6 +65,13 @@ def orca_step(agvs: list, corridor_half_w: float,
     corridor_width = 2.0 * corridor_half_w
     live = [a for a in agvs if not a.arrived]
 
+    from dlto_algorithm import (obstacle_plan, obstacle_traverse_state,
+                                slower_state)
+
+    # ORCA has no priority model — break the bottleneck tie by id (lower id
+    # goes first).
+    prio = lambda x: -x.aid
+
     for a in live:
         partner = None
         best_d = math.inf
@@ -72,11 +81,30 @@ def orca_step(agvs: list, corridor_half_w: float,
             d = math.hypot(a.x - b.x, a.y - b.y)
             # Use direction attribute (not heading angle) for robust detection
             # during tilted lateral offset execution.
-            if d <= DLTO_PLAN_RANGE and b.direction != a.direction:
+            if d <= DLTO_PLAN_RANGE and b.direction != a.direction \
+                    and not _passed(a, b):
                 if d < best_d:
                     partner, best_d = b, d
 
-        if partner is not None:
+        op = obstacle_plan(a, live, obstacles, corridor_width, prio) \
+            if obstacles else None
+
+        if op is not None:
+            tgt, wait, dist_obs = op
+            a.target_y = tgt
+            if wait:
+                a.state = "WAIT"
+            else:
+                if best_d <= D_CLEAR:
+                    partner_state = "CREEP"
+                elif best_d <= DETECT_RANGE:
+                    partner_state = "SLOW"
+                else:
+                    partner_state = "APPROACH"
+                a.state = slower_state(partner_state,
+                                       obstacle_traverse_state(a, dist_obs))
+
+        elif partner is not None:
             a.target_y = _lateral_target(a, partner, corridor_width,
                                          responsibility=0.5)
 
@@ -94,19 +122,7 @@ def orca_step(agvs: list, corridor_half_w: float,
                 partner_err = abs(partner.target_y - partner.y)
                 if partner_err > 0.25 and own_err < partner_err - 0.05:
                     a.state = "WAIT"
+
         else:
-            if obstacles:
-                from dlto_algorithm import find_obstacle_in_path, obstacle_avoidance_target
-                obs = find_obstacle_in_path(a, obstacles)
-                if obs is not None:
-                    a.target_y = obstacle_avoidance_target(a, obs, corridor_width)
-                    dist_to_obs = (obs.cx - a.x) * a.direction
-                    if dist_to_obs <= D_CLEAR:
-                        a.state = "CREEP"
-                    elif dist_to_obs <= DETECT_RANGE:
-                        a.state = "SLOW"
-                    else:
-                        a.state = "APPROACH"
-                    continue
             a.state = "RUN"
             a.target_y = 0.0

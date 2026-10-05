@@ -44,14 +44,25 @@ DPI        = 80
 
 ALGO_ORDER = ["DLTO", "SW", "ORCA", "FLC_ORCA"]
 
+# For "mixed" and obstacle profiles the cargo of each AGV is drawn at random;
+# seed 0 happens to leave BOTH vehicles unloaded (both blue).  Seed 1 yields one
+# loaded + one empty, so the red/blue cargo distinction is clearly visible.
+# "unloaded"/"loaded" force the cargo state, so their seed does not matter.
+SPLIT_CARGO_SEED = 1
+
+
+def seed_for(profile: str) -> int:
+    return SPLIT_CARGO_SEED if profile in (
+        "mixed", "obstacle_top", "obstacle_mid", "obstacle_bot") else SEED
+
 _ALGO_COL = {
     "DLTO":     "#e67e22",
     "SW":       "#c0392b",
     "ORCA":     "#8e44ad",
     "FLC_ORCA": "#16a085",
 }
-_COL_LOADED   = "#2ecc71"
-_COL_UNLOADED = "#3498db"
+_COL_LOADED   = "#e74c3c"   # cargo-laden AGV → red
+_COL_UNLOADED = "#3498db"   # empty AGV       → blue
 _COL_ARRIVED  = "#bbbbbb"
 _COL_DETOUR   = "#e74c3c"
 _COL_NORMAL   = "#2c3e50"
@@ -271,12 +282,13 @@ if __name__ == "__main__":
     t_all  = time.time()
 
     print(f"[+] Generating {len(main_configs)} main + {len(obs_configs)} obstacle "
-          f"comparison GIFs (n_agv={N_AGV}, seed={SEED}) ...\n")
+          f"comparison GIFs (n_agv={N_AGV}; mixed/obstacle use seed "
+          f"{SPLIT_CARGO_SEED} for visible cargo colours) ...\n")
 
     # Main experiment GIFs
     for cw, pp in main_configs:
         t0   = time.time()
-        path = make_comparison_gif(cw, pp, n_agv=N_AGV, seed=SEED)
+        path = make_comparison_gif(cw, pp, n_agv=N_AGV, seed=seed_for(pp))
         done += 1
         size  = os.path.getsize(path) / 1e6
         fname = os.path.basename(path)
@@ -286,7 +298,8 @@ if __name__ == "__main__":
     for cw, op in obs_configs:
         t0  = time.time()
         obs = make_obstacle_set(op, cw)
-        path = make_comparison_gif(cw, op, n_agv=N_AGV, seed=SEED, obstacles=obs)
+        path = make_comparison_gif(cw, op, n_agv=N_AGV, seed=seed_for(op),
+                                   obstacles=obs)
         done += 1
         size  = os.path.getsize(path) / 1e6
         fname = os.path.basename(path)
