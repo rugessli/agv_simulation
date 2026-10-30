@@ -52,3 +52,21 @@ N_REPLICATIONS   = 30
 OBSTACLE_PROFILES = ["obstacle_top", "obstacle_mid", "obstacle_bot"]
 OBSTACLE_N_AGV    = [2]
 OBSTACLE_SEEDS    = 30
+
+# Wait-for-offset release tolerance (m): an AGV already in its offset lane holds
+# position until the oncoming partner's lateral error falls below this value.
+# Tightened from 0.25 m so that passing never starts while the partner is still
+# mid-manoeuvre with a tilted body (observed MCD < D_MIN at 2.8 m, n_agv = 4).
+WAIT_OFFSET_TOL  = 0.05
+
+
+def hold_distance(partner_err: float) -> float:
+    """Centre-to-centre distance at which an AGV already in its offset lane must
+    hold while the oncoming partner completes its offset.  Physical basis: the
+    partner needs about 2*sqrt(R_min * remaining_error) of forward travel to finish
+    its lateral shift along arcs of the minimum turning radius, plus one body
+    length so the two bodies have not yet overlapped longitudinally, plus 0.5 m.
+    Never smaller than the original DETECT_RANGE trigger."""
+    import math
+    need = AGV_LENGTH + 2.0 * math.sqrt(AGV_MIN_TURN_R * max(partner_err, 0.0)) + 0.5
+    return max(DETECT_RANGE, need)

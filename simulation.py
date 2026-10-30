@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from config import WAIT_OFFSET_TOL, hold_distance
 from config import (
     AGV_LENGTH, AGV_WIDTH, CRUISE_SPEED, APPROACH_SPEED, OFFSET_SPEED, CREEP_SPEED,
     WALL_CLEARANCE, CORRIDOR_LENGTH, DT, T_MAX, T_DEAD,
@@ -172,10 +173,10 @@ def step_dlto(agvs: List[AGVState], t: float, pair_times: dict,
             a.state = _dist_based_state(dist)
 
             # Wait-for-offset: hold while partner is still completing its move
-            if dist <= DETECT_RANGE:
-                own_err = abs(a.target_y - a.y)
-                partner_err = abs(partner.target_y - partner.y)
-                if partner_err > 0.25 and own_err < partner_err - 0.05:
+            own_err = abs(a.target_y - a.y)
+            partner_err = abs(partner.target_y - partner.y)
+            if dist <= hold_distance(partner_err):
+                if partner_err > WAIT_OFFSET_TOL and own_err < partner_err - 0.05:
                     a.state = "WAIT"
 
         else:

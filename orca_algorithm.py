@@ -13,6 +13,7 @@ half-plane only to determine offset magnitude, not raw velocity.
 from __future__ import annotations
 import math
 
+from config import WAIT_OFFSET_TOL, hold_distance
 from config import (
     AGV_WIDTH, AGV_LENGTH, CRUISE_SPEED, DETECT_RANGE, DLTO_PLAN_RANGE,
     WALL_CLEARANCE, D_MIN, D_CLEAR,
@@ -117,10 +118,10 @@ def orca_step(agvs: list, corridor_half_w: float,
                 a.state = "APPROACH"
 
             # Fix 3: wait-for-offset rule
-            if best_d <= DETECT_RANGE:
-                own_err = abs(a.target_y - a.y)
-                partner_err = abs(partner.target_y - partner.y)
-                if partner_err > 0.25 and own_err < partner_err - 0.05:
+            own_err = abs(a.target_y - a.y)
+            partner_err = abs(partner.target_y - partner.y)
+            if best_d <= hold_distance(partner_err):
+                if partner_err > WAIT_OFFSET_TOL and own_err < partner_err - 0.05:
                     a.state = "WAIT"
 
         else:
