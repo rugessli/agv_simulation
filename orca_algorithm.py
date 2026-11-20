@@ -1,14 +1,17 @@
 """ORCA for non-holonomic AGVs in a corridor.
 
 Standard ORCA computes collision-free 2D velocities. Applied to a unicycle
-model in a narrow corridor, large heading deviations (>45°) cause the rotated
-AGV body to block itself. This implementation uses the ORCA half-plane to
-compute the *responsibility coefficient* (default 0.5 = symmetric), then
-assigns a proportional lateral offset — identical to the DLTO controller but
-with the symmetric 50/50 offset split instead of priority-based.
+model in a narrow corridor, large heading deviations (>45 deg) cause the rotated
+AGV body to block itself. This implementation therefore keeps only ORCA's
+responsibility-allocation principle: the fixed reciprocal coefficient 0.5
+(each vehicle takes half of the avoidance) is mapped to a lateral offset in the
+same offset framework, controller and safety layer as DLTO. No velocity-obstacle
+half-planes are computed.
 
-Reference: Van den Berg et al. (2011), extended to unicycle by using the
-half-plane only to determine offset magnitude, not raw velocity.
+`max_offset_step` is an additional reference baseline (not ORCA) in which both
+vehicles take the maximum admissible offset (coefficient 1.0).
+
+Reference: van den Berg et al. (2011).
 """
 from __future__ import annotations
 import math
@@ -62,7 +65,7 @@ def _rear_clear_for_offset(agv, agvs: list) -> bool:
 
 
 def orca_step(agvs: list, corridor_half_w: float,
-              obstacles: list = None) -> None:
+              obstacles: list = None, responsibility: float = 0.5) -> None:
     corridor_width = 2.0 * corridor_half_w
     live = [a for a in agvs if not a.arrived]
 
@@ -107,7 +110,7 @@ def orca_step(agvs: list, corridor_half_w: float,
 
         elif partner is not None:
             a.target_y = _lateral_target(a, partner, corridor_width,
-                                         responsibility=0.5)
+                                         responsibility=responsibility)
 
             # Fix 1: four-speed state ladder
             if best_d <= D_CLEAR:
@@ -127,3 +130,9 @@ def orca_step(agvs: list, corridor_half_w: float,
         else:
             a.state = "RUN"
             a.target_y = 0.0
+
+
+def max_offset_step(agvs: list, corridor_half_w: float,
+                    obstacles: list = None) -> None:
+    """Reference baseline: both vehicles take the maximum admissible offset."""
+    orca_step(agvs, corridor_half_w, obstacles=obstacles, responsibility=1.0)

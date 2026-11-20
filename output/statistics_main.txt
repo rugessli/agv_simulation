@@ -1,0 +1,67 @@
+DRR
+ algorithm  DLTO  ORCA  FLC_ORCA   SW
+mean        1.0   1.0       1.0  0.0
+std         0.0   0.0       0.0  0.0
+
+ART
+ corridor_width     2.8     3.2     3.6  overall    sd
+algorithm                                            
+DLTO              6.70    6.45    6.15     6.43  0.34
+ORCA              6.70    6.48    6.21     6.46  0.32
+FLC_ORCA          6.70    6.45    6.20     6.45  0.33
+SW              108.14  108.14  108.14   108.14  1.07
+
+ST
+ algorithm   DLTO   ORCA  FLC_ORCA   SW
+mean       38.38  38.34     38.34  0.0
+std         4.63   4.61      4.62  0.0
+
+NEC
+ algorithm   DLTO   ORCA  FLC_ORCA     SW
+mean       2.384  2.382     2.382  0.390
+std        0.254  0.253     0.253  0.081
+
+MCD mean (sd)
+ algorithm                                 DLTO            ORCA        FLC_ORCA
+corridor_width payload_profile                                                
+2.8            loaded           0.3182 (0.004)  0.3182 (0.004)  0.3182 (0.004)
+               mixed            0.3184 (0.004)  0.3184 (0.004)  0.3184 (0.004)
+               unloaded         0.3175 (0.005)  0.3175 (0.005)  0.3175 (0.005)
+3.2            loaded           0.5036 (0.006)  0.4994 (0.005)  0.5132 (0.006)
+               mixed            0.5287 (0.026)  0.4998 (0.005)  0.5134 (0.005)
+               unloaded         0.5131 (0.008)  0.4987 (0.006)  0.5116 (0.006)
+3.6            loaded           0.6911 (0.008)  0.6831 (0.006)  0.7108 (0.008)
+               mixed            0.7376 (0.053)  0.6835 (0.006)  0.7111 (0.008)
+               unloaded         0.7108 (0.011)  0.6819 (0.007)  0.7081 (0.009)
+overall MCD
+ algorithm    DLTO    ORCA  FLC_ORCA      SW
+mean       0.5154  0.5001    0.5136  0.0000
+std        0.1632  0.1491    0.1603  0.0003
+min        0.3050  0.3050    0.3050  0.0000
+
+Paired comparisons
+mixed 3.2       MCD     DLTO 0.5287 vs ORCA 0.4998  +5.77%  p=3.7e-15  dz=+1.13  n=90
+mixed 3.2       MCD     DLTO 0.5287 vs FLC_ORCA 0.5134  +2.98%  p=1.4e-05  dz=+0.59  n=90
+mixed 3.6       MCD     DLTO 0.7376 vs ORCA 0.6835  +7.92%  p=1.1e-14  dz=+1.04  n=90
+mixed 3.6       MCD     DLTO 0.7376 vs FLC_ORCA 0.7111  +3.72%  p=0.00058  dz=+0.50  n=90
+mixed           MCD     DLTO 0.5282 vs ORCA 0.5006  +5.52%  p=3.2e-28  dz=+0.69  n=270
+mixed           MCD     DLTO 0.5282 vs FLC_ORCA 0.5143  +2.71%  p=5.6e-08  dz=+0.39  n=270
+unloaded        MCD     DLTO 0.5138 vs ORCA 0.4994  +2.89%  p=2.7e-31  dz=+1.13  n=270
+unloaded        MCD     DLTO 0.5138 vs FLC_ORCA 0.5124  +0.27%  p=0.00054  dz=+0.21  n=270
+loaded          MCD     DLTO 0.5043 vs ORCA 0.5002  +0.81%  p=2.7e-31  dz=+0.85  n=270
+loaded          MCD     DLTO 0.5043 vs FLC_ORCA 0.5141  -1.90%  p=2.8e-31  dz=-1.04  n=270
+overall         MCD     DLTO 0.5154 vs ORCA 0.5001  +3.08%  p=1.4e-85  dz=+0.59  n=810
+overall         MCD     DLTO 0.5154 vs FLC_ORCA 0.5136  +0.36%  p=0.0028  dz=+0.08  n=810
+overall         ART     DLTO 6.4331 vs ORCA 6.4627  -0.46%  p=2.3e-26  dz=-0.39  n=810
+overall         ART     DLTO 6.4331 vs FLC_ORCA 6.4469  -0.21%  p=2.4e-05  dz=-0.16  n=810
+overall         ST      DLTO 38.3787 vs ORCA 38.3405  +0.10%  p=1.6e-10  dz=+0.17  n=810
+overall         ST      DLTO 38.3787 vs FLC_ORCA 38.3429  +0.09%  p=1.7e-09  dz=+0.13  n=810
+overall         NEC_raw DLTO 2.3843 vs ORCA 2.3817  +0.11%  p=6.4e-15  dz=+0.19  n=810
+overall         NEC_raw DLTO 2.3843 vs FLC_ORCA 2.3819  +0.10%  p=3.5e-11  dz=+0.14  n=810
+
+Fleet size, 3.6 m mixed
+n=2             MCD     DLTO 0.7600 vs ORCA 0.6844  +11.06%  p=1.9e-09  dz=+1.33  n=30
+n=3             MCD     DLTO 0.7362 vs ORCA 0.6835  +7.71%  p=1.9e-09  dz=+1.08  n=30
+n=4             MCD     DLTO 0.7165 vs ORCA 0.6825  +4.98%  p=5.6e-05  dz=+0.81  n=30
+
+Runs in which a vehicle faced >= 2 opposite vehicles within d_detect: 28 of 1620

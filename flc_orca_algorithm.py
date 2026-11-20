@@ -1,9 +1,12 @@
 """FLC-ORCA: fuzzy responsibility coefficient for corridor AGV avoidance.
 
-Based on Ibrahim et al. (2023). The fuzzy system replaces the fixed 0.5
-coefficient used by standard ORCA. Higher responsibility → vehicle must
-deviate more from its preferred path. All physical movement uses the
-same unicycle steering controller as DLTO/ORCA.
+Responsibility-allocation principle of FLC-ORCA (Mohd Romlay et al., 2023):
+a fuzzy system replaces the fixed 0.5 coefficient of standard ORCA, using the
+normalised distance to the partner and the closing speed (sum of the two
+speeds in a head-on encounter) as inputs. Higher responsibility -> the vehicle
+deviates more from its preferred path. The coefficient is mapped to a lateral
+offset in the same offset framework, controller and safety layer as DLTO and
+ORCA; no velocity-obstacle half-planes are computed.
 """
 from __future__ import annotations
 import math
@@ -137,7 +140,8 @@ def flc_orca_step(agvs: list, corridor_half_w: float,
                                        obstacle_traverse_state(a, dist_obs))
 
         elif partner is not None:
-            closing_speed = max(1e-6, abs(a.v - partner.v) + 0.5)
+            # head-on encounter: the two vehicles move towards each other, so their speeds add
+            closing_speed = max(1e-6, a.v + partner.v)
             rel_dist_norm = min(1.0, best_d / DLTO_PLAN_RANGE)
             rel_vel_norm  = min(1.0, closing_speed / CRUISE_SPEED)
             resp = _fuzzy_responsibility(rel_dist_norm, rel_vel_norm)

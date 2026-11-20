@@ -34,7 +34,7 @@ D_LOOKAHEAD      = 1.5
 T_MAX            = 120.0   # serialised obstacle passing (one vehicle waits for the
                           # other to clear a single-file bottleneck) legitimately
                           # needs more wall-clock than an open-corridor encounter.
-T_DEAD           = 2.0
+T_DEAD           = 3.0   # deadlock confirmation time (Section 3.2); not used in the metrics
 DT               = 0.1
 CORRIDOR_LENGTH  = 40.0
 PRIORITY_ALPHA   = 0.50   # cargo state

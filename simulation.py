@@ -21,7 +21,7 @@ from dlto_algorithm import (
     obstacle_plan, obstacle_traverse_state, slower_state,
     _priority_score,
 )
-from orca_algorithm import orca_step
+from orca_algorithm import orca_step, max_offset_step
 from flc_orca_algorithm import flc_orca_step
 
 MAX_SIM_TIME   = T_MAX
@@ -439,6 +439,9 @@ def run_scenario(n_agv: int, algorithm: str, seed: int,
             _sync_orca_state(agvs, t, pair_times)
         elif algorithm == "FLC_ORCA":
             flc_orca_step(agvs, corridor_half_w, obstacles=obstacles)
+            _sync_orca_state(agvs, t, pair_times)
+        elif algorithm == "MAX_OFFSET":
+            max_offset_step(agvs, corridor_half_w, obstacles=obstacles)
             _sync_orca_state(agvs, t, pair_times)
         else:
             raise ValueError(f"Unknown algorithm: {algorithm!r}")
