@@ -27,6 +27,12 @@ def _is_head_on(theta_a: float, theta_b: float) -> bool:
 
 
 def _trimf(x: float, a: float, b: float, c: float) -> float:
+    """Triangular membership; a == b (b == c) gives a left (right) shoulder that
+    stays at 1 for inputs at or beyond the end of the normalised range."""
+    if a == b and x <= a:
+        return 1.0
+    if b == c and x >= c:
+        return 1.0
     if x <= a or x >= c:
         return 0.0
     if x <= b:

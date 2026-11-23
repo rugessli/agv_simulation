@@ -1,4 +1,25 @@
-# Changes on branch `jirs-revision`
+# Changes in release v1.1-jirs
+
+## FLC-ORCA membership functions (bug fix)
+- `flc_orca_algorithm.py`, `_trimf()`: shoulder sets (a == b or b == c) now return 1 at and beyond
+  the end of the normalised range. Previously the "fast" set returned 0 when the closing speed
+  reached the cruise speed (normalised input capped at 1), all nine rules fired with zero strength
+  and the responsibility fell back to 0.5 (ORCA behaviour) in about one third of vehicle pairs.
+- Effect: only FLC-ORCA results change; DLTO, ORCA and SW are identical, and the obstacle
+  experiment is unchanged. FLC-ORCA overall MCD 0.5136 -> 0.5156 m; DLTO vs FLC-ORCA with mixed
+  payloads +2.7 % -> +2.4 % (p < 0.001); overall practically equal (-0.03 %).
+- Re-run: `output/results.csv`, `results_summary.csv`, `statistics_main.txt`,
+  `experiments/results/robustness.csv`, `robustness_discard_after_timeout.csv`, `max_offset.csv`.
+
+## Figures
+- `figures/fig4_main_results.py`, `gen_metric_comparison.py`: titles removed from inside the figures
+  (journal requirement); Fig. 4 regenerated.
+- `figures/fig1_corridor.py` (new): schematic of the corridor used as Fig. 1.
+- `figures/fig5_obstacle.py` (new): obstacle results at print size (Fig. 5).
+
+---
+
+# Changes in release v1.0-jirs
 
 ## 1. FLC-ORCA closing speed (bug fix)
 - `flc_orca_algorithm.py`: in a head-on encounter the two vehicles move towards each other, so the

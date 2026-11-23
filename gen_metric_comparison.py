@@ -68,9 +68,6 @@ def main() -> None:
     bw = 0.20
 
     fig, axes = plt.subplots(1, 5, figsize=(30, 5.2))
-    fig.suptitle("Obstacle scenarios — 4-algorithm comparison "
-                 "(n_agv=2, 30-replication mean)  |  MID@2.8m = physically impassable",
-                 fontsize=14, weight="bold", y=1.02)
 
     for ax, (title, fn) in zip(axes, panels):
         for k, algo in enumerate(ALGOS):
@@ -88,7 +85,7 @@ def main() -> None:
                 ax.axvspan(i - 0.5, i + 0.5, color="#cccccc", alpha=0.30, zorder=0)
     axes[0].legend(fontsize=8, loc="center left")
 
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.tight_layout()
     fig.savefig(PNG, dpi=110, bbox_inches="tight")
     plt.close(fig)
     print(f"[+] wrote {PNG}")

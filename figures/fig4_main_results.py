@@ -33,5 +33,4 @@ for ax,(pp,t) in zip(axs[1],[('unloaded','(d) MCD — Unloaded Payload (m)'),('m
     ax.set_ylim(0,0.98); ax.set_ylabel('Min. Clearance Distance (m)'); ax.set_title(t,fontweight='bold')
 fig.legend(handles=[Patch(facecolor=COL[a],edgecolor='#333',label=LAB.get(a,a)) for a in A],loc='lower center',ncol=4,fontsize=11)
 n=len(df)//4
-fig.suptitle(f'Main Experiment Results — 4-Algorithm Comparison  (n = {n} per algorithm; error bars = ±1 SD)',fontweight='bold',fontsize=14)
-fig.tight_layout(rect=(0,0.05,1,0.96)); fig.savefig(out,dpi=150); print('saved',out)
+fig.tight_layout(rect=(0,0.05,1,1)); fig.savefig(out,dpi=150); print('saved',out)
